@@ -17,12 +17,12 @@ fn main() -> anyhow::Result<()> {
 
     for font in cache.set()?.fonts()?.take(1) {
         let font = font?;
-        println!("font {:?}", font.payload());
+        println!("font {:?}", font.payload()?);
 
         for elt in font.elts()? {
             println!(
                 "object type {:?}",
-                Object::try_from(elt.payload().object).unwrap()
+                Object::try_from(elt.payload()?.object).unwrap()
             );
 
             for val in elt.values()? {

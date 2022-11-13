@@ -53,7 +53,7 @@ impl<'a> Ptr<'a, ValueData> {
     /// Converts the raw
     pub fn to_value(&self) -> Result<Value<'a>> {
         use Value::*;
-        let payload = self.payload();
+        let payload = self.payload()?;
 
         unsafe {
             Ok(match payload.ty {
@@ -61,13 +61,13 @@ impl<'a> Ptr<'a, ValueData> {
                 0 => Void,
                 1 => Int(payload.val.i),
                 2 => Float(payload.val.d),
-                3 => String(self.decode(payload.val.s)?),
+                3 => String(self.relative_offset(payload.val.s)?),
                 4 => Bool(payload.val.b),
-                5 => Matrix(self.decode(payload.val.m)?),
-                6 => CharSet(self.decode(payload.val.c)?),
-                7 => FtFace(self.decode(payload.val.f)?),
-                8 => LangSet(self.decode(payload.val.l)?),
-                9 => Range(self.decode(payload.val.r)?),
+                5 => Matrix(self.relative_offset(payload.val.m)?),
+                6 => CharSet(self.relative_offset(payload.val.c)?),
+                7 => FtFace(self.relative_offset(payload.val.f)?),
+                8 => LangSet(self.relative_offset(payload.val.l)?),
+                9 => Range(self.relative_offset(payload.val.r)?),
                 _ => return Err(Error::InvalidEnumTag(payload.ty)),
             })
         }
@@ -248,36 +248,6 @@ fn offset<T: Copy>(off: isize) -> Offset<T> {
 unsafe impl<T: Copy> bytemuck::Zeroable for Offset<T> {}
 unsafe impl<T: Copy + 'static> bytemuck::Pod for Offset<T> {}
 
-impl<'buf, Off: IntoOffset> Ptr<'buf, Off> {
-    pub fn deref(self) -> Result<Ptr<'buf, Off::Item>> {
-        let offset = self.payload().into_offset()?;
-        self.decode(offset)
-    }
-}
-
-// TODO: better names for this offset-calculating functions
-impl<'a, T: Copy + AnyBitPattern> Ptr<'a, Offset<T>> {
-    pub fn deref_offset(mut self, base_offset: isize) -> Result<Ptr<'a, T>> {
-        self.offset = base_offset;
-        self.decode(self.payload())
-    }
-}
-
-impl<'a, T: Copy + AnyBitPattern> Ptr<'a, PtrOffset<T>> {
-    pub fn deref_offset(mut self, base_offset: isize) -> Result<Ptr<'a, T>> {
-        self.offset = base_offset;
-        self.decode(self.payload())
-    }
-}
-
-impl<T: Copy + AnyBitPattern> Offset<T> {
-    pub fn relative_to(self, base_offset: isize) -> Result<isize> {
-        self.0
-            .checked_add(base_offset)
-            .ok_or(Error::BadOffset(self.0))
-    }
-}
-
 impl std::fmt::Debug for ValueData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!("{}", self.ty))
@@ -295,7 +265,7 @@ pub struct ValueList {
 
 impl<'a> Ptr<'a, ValueList> {
     fn value(&self) -> Result<Ptr<'a, ValueData>> {
-        self.decode(offset(std::mem::size_of_val(&self.payload().next) as isize))
+        self.relative_offset(offset(std::mem::size_of_val(&self.payload()?.next) as isize))
     }
 }
 
@@ -307,15 +277,22 @@ impl<'a> Iterator for ValueListIter<'a> {
     type Item = Result<Ptr<'a, ValueData>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(Ok(next)) = self.next.take() {
-            let next_payload = next.payload();
-            if next_payload.next.0 == 0 {
-                self.next = None;
-            } else {
-                self.next = Some(next.decode(next_payload.next));
+        let next = self.next.take();
+        if let Some(Ok(next)) = next {
+            match next.payload() {
+                Ok(next_payload) => {
+                    if next_payload.next.0 == 0 {
+                        self.next = None;
+                    } else {
+                        self.next = Some(next.relative_offset(next_payload.next));
+                    }
+                }
+                Err(e) => {
+                    self.next = Some(Err(e));
+                }
             }
             Some(next.value())
-        } else if let Some(Err(e)) = self.next.take() {
+        } else if let Some(Err(e)) = next {
             Some(Err(e))
         } else {
             None
@@ -337,8 +314,8 @@ pub struct Pattern {
 
 impl Ptr<'_, Pattern> {
     pub fn elts(&self) -> Result<impl Iterator<Item = Ptr<PatternElt>> + '_> {
-        let payload = self.payload();
-        let elts = self.decode_without_length_check(payload.elts_offset)?;
+        let payload = self.payload()?;
+        let elts = self.relative_offset(payload.elts_offset)?;
         elts.array(payload.num)
     }
 }
@@ -353,7 +330,7 @@ pub struct PatternElt {
 impl Ptr<'_, PatternElt> {
     pub fn values(&self) -> Result<impl Iterator<Item = Result<Ptr<ValueData>>> + '_> {
         Ok(ValueListIter {
-            next: Some(Ok(self.decode(self.payload().values)?)),
+            next: Some(Ok(self.relative_offset(self.payload()?.values)?)),
         })
     }
 }
@@ -369,10 +346,10 @@ pub struct FontSet {
 
 impl Ptr<'_, FontSet> {
     pub fn fonts(&self) -> Result<impl Iterator<Item = Result<Ptr<Pattern>>> + '_> {
-        let payload = self.payload();
+        let payload = self.payload()?;
         let fonts = self.relative_offset(payload.fonts)?.array(payload.nfont)?;
         let me = self.clone();
-        Ok(fonts.map(move |font_offset| me.relative_offset(font_offset.payload())))
+        Ok(fonts.map(move |font_offset| me.relative_offset(font_offset.payload()?)))
     }
 }
 
@@ -389,23 +366,23 @@ pub struct CharSet {
 
 impl<'buf> Ptr<'buf, CharSet> {
     pub fn leaves(&self) -> Result<impl Iterator<Item = Result<Ptr<'buf, CharSetLeaf>>> + 'buf> {
-        let payload = self.payload();
+        let payload = self.payload()?;
         let leaf_array = self.relative_offset(payload.leaves)?;
         Ok(leaf_array
             .array(payload.num)?
-            .map(move |leaf_offset| leaf_array.relative_offset(leaf_offset.payload())))
+            .map(move |leaf_offset| leaf_array.relative_offset(leaf_offset.payload()?)))
     }
 
     pub fn numbers(&self) -> Result<impl Iterator<Item = Ptr<'buf, u16>> + 'buf> {
-        let payload = self.payload();
+        let payload = self.payload()?;
         self.relative_offset(payload.numbers)?.array(payload.num)
     }
 
     pub fn chunks(&self) -> Result<impl Iterator<Item = Result<CharSetChunk>> + 'buf> {
         Ok(self.leaves()?.zip(self.numbers()?).map(|(leaf, number)| {
             Ok(CharSetChunk {
-                offset: number.payload(),
-                map: leaf?.payload().map,
+                offset: number.payload()?,
+                map: leaf?.payload()?.map,
             })
         }))
     }
@@ -539,13 +516,6 @@ impl<'buf> Ptr<'buf, u8> {
 }
 
 impl<'a, S: AnyBitPattern> Ptr<'a, S> {
-    pub fn offset<T: AnyBitPattern>(&self, offset: impl IntoOffset<Item = T>) -> Result<isize> {
-        let offset = offset.into_offset()?;
-        self.offset
-            .checked_add(offset.0)
-            .ok_or(Error::BadOffset(offset.0))
-    }
-
     pub fn relative_offset<Off: IntoOffset>(&self, offset: Off) -> Result<Ptr<'a, Off::Item>> {
         let offset = offset.into_offset()?;
         Ok(Ptr {
@@ -558,46 +528,17 @@ impl<'a, S: AnyBitPattern> Ptr<'a, S> {
         })
     }
 
-    pub fn payload(&self) -> S {
+    pub fn payload(&self) -> Result<S> {
         let len = std::mem::size_of::<S>() as isize;
-        // We checked at construction time that the buffer has enough elements for the payload,
-        // so the slice will succeed.
-        bytemuck::try_pod_read_unaligned(
-            &self.buf[(self.offset as usize)..((self.offset + len) as usize)],
-        )
-        .expect("but we checked the length...")
-    }
-
-    pub fn decode<T: AnyBitPattern>(
-        &self,
-        offset: impl IntoOffset<Item = T>,
-    ) -> Result<Ptr<'a, T>> {
-        let len = std::mem::size_of::<T>() as isize;
-        let offset = self.offset(offset)?;
-        if offset < 0 || len + offset > self.buf.len() as isize {
-            Err(Error::BadOffset(offset))
+        if self.offset + len >= self.buf.len() as isize {
+            Err(Error::BadOffset(self.offset))
         } else {
-            Ok(Ptr {
-                buf: self.buf,
-                offset,
-                marker: std::marker::PhantomData,
-            })
-        }
-    }
-
-    fn decode_without_length_check<T: AnyBitPattern>(
-        &self,
-        offset: impl IntoOffset<Item = T>,
-    ) -> Result<Ptr<'a, T>> {
-        let offset = self.offset(offset)?;
-        if offset < 0 {
-            Err(Error::BadOffset(offset))
-        } else {
-            Ok(Ptr {
-                buf: self.buf,
-                offset,
-                marker: std::marker::PhantomData,
-            })
+            // We checked at construction time that the buffer has enough elements for the payload,
+            // so the slice will succeed.
+            Ok(bytemuck::try_pod_read_unaligned(
+                &self.buf[(self.offset as usize)..((self.offset + len) as usize)],
+            )
+            .expect("but we checked the length..."))
         }
     }
 
@@ -672,6 +613,6 @@ impl Cache {
 
 impl<'buf> Ptr<'buf, Cache> {
     pub fn set(&self) -> Result<Ptr<'buf, FontSet>> {
-        self.decode(self.payload().set)
+        self.relative_offset(self.payload()?.set)
     }
 }
