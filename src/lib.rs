@@ -1,30 +1,77 @@
 use bytemuck::AnyBitPattern;
 use std::os::raw::{c_int, c_uint};
 
-type Result<T> = std::result::Result<T, CacheFormatError>;
+type Result<T> = std::result::Result<T, Error>;
 
+// Many of fontconfig's values are stored as a tagged union. But because
+// there's no layout guarantees for tagged unions in rust, we read them
+// in the C layout, as a combination of `c_int` tag and an untagged union.
+//
+// This is the untagged union part, which we don't expose publicly.
 #[repr(C)]
-#[derive(Copy, Clone, Debug)]
-pub enum Type {
-    Unknown = -1,
-    Void,
-    Integer,
-    Double,
-    String,
-    Bool,
-    Matrix,
-    CharSet,
-    FtFace,
-    LangSet,
-    Range,
+#[derive(AnyBitPattern, Copy, Clone)]
+union ValueUnion {
+    s: PtrOffset<u8>,
+    i: c_int,
+    b: c_int,
+    d: f64,
+    m: PtrOffset<()>, // TODO
+    c: PtrOffset<CharSet>,
+    f: PtrOffset<()>,
+    l: PtrOffset<()>, // TODO
+    r: PtrOffset<()>, // TODO
 }
 
+/// A wrapper around fontconfig's `FcValue` type.
+#[derive(Clone, Debug)]
+pub enum Value<'a> {
+    Unknown,
+    Void,
+    Int(c_int),
+    Float(f64),
+    String(Ptr<'a, u8>),
+    Bool(c_int),
+    /// Not yet supported
+    Matrix(Ptr<'a, ()>),
+    CharSet(Ptr<'a, CharSet>),
+    /// Not yet supported
+    FtFace(Ptr<'a, ()>),
+    /// Not yet supported
+    LangSet(Ptr<'a, ()>),
+    /// Not yet supported
+    Range(Ptr<'a, ()>),
+}
+
+#[derive(AnyBitPattern, Copy, Clone)]
 #[repr(C)]
-#[derive(Copy, Clone, Debug)]
-pub enum ValueBinding {
-    Weak,
-    Strong,
-    Same,
+pub struct ValueData {
+    ty: c_int,
+    val: ValueUnion,
+}
+
+impl<'a> Ptr<'a, ValueData> {
+    /// Converts the raw
+    pub fn to_value(&self) -> Result<Value<'a>> {
+        use Value::*;
+        let payload = self.payload();
+
+        unsafe {
+            Ok(match payload.ty {
+                -1 => Unknown,
+                0 => Void,
+                1 => Int(payload.val.i),
+                2 => Float(payload.val.d),
+                3 => String(self.decode(payload.val.s)?),
+                4 => Bool(payload.val.b),
+                5 => Matrix(self.decode(payload.val.m)?),
+                6 => CharSet(self.decode(payload.val.c)?),
+                7 => FtFace(self.decode(payload.val.f)?),
+                8 => LangSet(self.decode(payload.val.l)?),
+                9 => Range(self.decode(payload.val.r)?),
+                _ => return Err(Error::InvalidEnumTag(payload.ty)),
+            })
+        }
+    }
 }
 
 #[repr(C)]
@@ -88,17 +135,20 @@ pub enum Object {
 const MAX_OBJECT: c_int = Object::Order as c_int;
 
 impl TryFrom<c_int> for Object {
-    type Error = CacheFormatError;
+    type Error = Error;
 
     fn try_from(value: c_int) -> Result<Self> {
         if value <= MAX_OBJECT {
             Ok(unsafe { std::mem::transmute(value) })
         } else {
-            Err(CacheFormatError::InvalidObjectTag(value))
+            Err(Error::InvalidObjectTag(value))
         }
     }
 }
 
+/// A relative offset to another struct in the cache, which is encoded as a pointer in fontconfig.
+///
+/// See [`Offset`] for more on offsets in fontconfig and how we handle them in this crate.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct PtrOffset<T: Copy>(isize, std::marker::PhantomData<T>);
@@ -106,123 +156,129 @@ pub struct PtrOffset<T: Copy>(isize, std::marker::PhantomData<T>);
 unsafe impl<T: Copy> bytemuck::Zeroable for PtrOffset<T> {}
 unsafe impl<T: Copy + 'static> bytemuck::Pod for PtrOffset<T> {}
 
-pub trait IntoOffset<T: Copy> {
-    fn into_offset(self) -> Result<Offset<T>>;
+/// This is basically equivalent to `TryInto<Offset<T>, Error=Error>`, but having this
+/// alias makes type inference work better.
+pub trait IntoOffset: AnyBitPattern + Copy {
+    type Item: AnyBitPattern + Copy;
+
+    fn into_offset(self) -> Result<Offset<Self::Item>>;
 }
 
-impl<T: Copy> IntoOffset<T> for PtrOffset<T> {
+impl<T: AnyBitPattern + Copy> IntoOffset for PtrOffset<T> {
+    type Item = T;
+
     fn into_offset(self) -> Result<Offset<T>> {
         if self.0 & 1 == 0 {
-            Err(CacheFormatError::BadPointer(self.0))
+            Err(Error::BadPointer(self.0))
         } else {
             Ok(Offset(self.0 & !1, std::marker::PhantomData))
         }
     }
 }
 
-impl<T: Copy> IntoOffset<T> for Offset<T> {
+impl<T: AnyBitPattern + Copy> IntoOffset for Offset<T> {
+    type Item = T;
+
     fn into_offset(self) -> Result<Offset<T>> {
         Ok(self)
     }
 }
 
-impl<T: Copy> IntoOffset<T> for usize {
-    fn into_offset(self) -> Result<Offset<T>> {
-        Ok(Offset(self as isize, std::marker::PhantomData))
-    }
-}
-
+/// A relative offset to another struct in the cache.
+///
+/// Fontconfig's cache is stuctured as a collection of structs.
+/// These structs are encoded in the cache by
+/// writing their bytes into a cache file. (So the format is architecture-dependent.)
+/// The structs reference each other using relative offsets, so for example in the struct
+///
+/// ```C
+/// struct FcPattern {
+///     int num;
+///     int size;
+///     intptr_t elts_offset;
+///     int ref;
+/// }
+/// ```
+///
+/// the elements `num`, `size`, and `ref` are just plain old data, and the element `elts_offset`
+/// says that there is some other struct (which happens to be an `FcPatternElt` in this case)
+/// stored at the location `base_offset + elts_offset`, where `base_offset` is the offset
+/// of the `FcPattern`. Note that `elts_offset` is signed: it can be negative.
+///
+/// We encode these offsets using `Offset`, so for example the struct above gets translated to
+///
+/// ```rust
+/// struct Pattern {
+///     num: c_int,
+///     size: c_int,
+///     elts_offset: Offset<PatternElt>,
+///     ref: c_int,
+/// }
+/// ```
+///
+/// Sometimes, the structs in fontconfig contain pointers instead of offsets, like for example
+///
+/// ```C
+/// struct FcPatternElt {
+///     FcObject object;
+///     FcValueList *values;
+/// }
+///
+/// In this case, fontconfig actually handles two cases: if the lowest-order bit of `values` is 0
+/// it's treated as a normal pointer, but if the lowest-order bit is 1 then that bit is set
+/// to zero and `values` is treated as an offset. When the struct came from a cache file that
+/// was serialized to disk (which we always are in this crate), it should always be in the "offset" case.
+/// That is, these pointers get treated almost the same as offsets, except that we need to
+/// sanity-check the low-order bit and then set it to zero. We encode these as `PtrOffset`,
+/// so for example the struct above gets translated to
+///
+/// ```rust
+/// struct PatternElt {
+///     object: c_int,
+///     values: PtrOffset<ValueList>,
+/// }
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Offset<T: Copy>(isize, std::marker::PhantomData<T>);
 
+fn offset<T: Copy>(off: isize) -> Offset<T> {
+    Offset(off, std::marker::PhantomData)
+}
+
 unsafe impl<T: Copy> bytemuck::Zeroable for Offset<T> {}
 unsafe impl<T: Copy + 'static> bytemuck::Pod for Offset<T> {}
 
-impl<'a, T: Copy + AnyBitPattern> Encoded<'a, Offset<T>> {
-    pub fn deref_offset(mut self, base_offset: isize) -> Result<Encoded<'a, T>> {
+impl<'buf, Off: IntoOffset> Ptr<'buf, Off> {
+    pub fn deref(self) -> Result<Ptr<'buf, Off::Item>> {
+        let offset = self.payload().into_offset()?;
+        self.decode(offset)
+    }
+}
+
+// TODO: better names for this offset-calculating functions
+impl<'a, T: Copy + AnyBitPattern> Ptr<'a, Offset<T>> {
+    pub fn deref_offset(mut self, base_offset: isize) -> Result<Ptr<'a, T>> {
         self.offset = base_offset;
-        self.decode(self.payload)
+        self.decode(self.payload())
     }
 }
 
-impl<'a, T: Copy + AnyBitPattern> Encoded<'a, PtrOffset<T>> {
-    pub fn deref_offset(mut self, base_offset: isize) -> Result<Encoded<'a, T>> {
+impl<'a, T: Copy + AnyBitPattern> Ptr<'a, PtrOffset<T>> {
+    pub fn deref_offset(mut self, base_offset: isize) -> Result<Ptr<'a, T>> {
         self.offset = base_offset;
-        self.decode(self.payload)
+        self.decode(self.payload())
     }
 }
 
-#[repr(C)]
-#[derive(AnyBitPattern, Copy, Clone)]
-pub union ValueUnion {
-    s: PtrOffset<u8>,
-    i: c_int,
-    b: c_int,
-    d: f64,
-    m: PtrOffset<()>, // TODO
-    c: PtrOffset<()>, // TODO
-    f: PtrOffset<()>,
-    l: PtrOffset<()>, // TODO
-    r: PtrOffset<()>, // TODO
-}
-
-#[derive(Copy, Clone, Debug)]
-pub enum ValueEnum {
-    Unknown,
-    Void,
-    Int(c_int),
-    Float(f64),
-    String(PtrOffset<u8>),
-    Bool(c_int),
-    Matrix(PtrOffset<()>),
-    CharSet(PtrOffset<()>),
-    FtFace(PtrOffset<()>),
-    LangSet(PtrOffset<()>),
-    Range(PtrOffset<()>),
-}
-
-#[derive(AnyBitPattern, Copy, Clone)]
-#[repr(C)]
-pub struct Value {
-    ty: c_int, // Actually a Type, but we need to check it (TODO)
-    val: ValueUnion,
-}
-
-impl Value {
-    pub fn to_enum(&self) -> Result<ValueEnum> {
-        use ValueEnum::*;
-
-        unsafe {
-            Ok(match self.ty {
-                -1 => Unknown,
-                0 => Void,
-                1 => Int(self.val.i),
-                2 => Float(self.val.d),
-                3 => String(self.val.s),
-                4 => Bool(self.val.b),
-                5 => Matrix(self.val.m),
-                6 => CharSet(self.val.c),
-                7 => FtFace(self.val.f),
-                8 => LangSet(self.val.l),
-                9 => Range(self.val.r),
-                _ => return Err(CacheFormatError::InvalidEnumTag(self.ty)),
-            })
-        }
+impl<T: Copy + AnyBitPattern> Offset<T> {
+    pub fn relative_to(self, base_offset: isize) -> Result<isize> {
+        self.0
+            .checked_add(base_offset)
+            .ok_or(Error::BadOffset(self.0))
     }
 }
 
-impl<'a> Encoded<'a, Value> {
-    pub fn to_enum(&self) -> Result<Encoded<'a, ValueEnum>> {
-        Ok(Encoded {
-            buf: self.buf,
-            offset: self.offset,
-            payload: self.payload.to_enum()?,
-        })
-    }
-}
-
-impl std::fmt::Debug for Value {
+impl std::fmt::Debug for ValueData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!("{}", self.ty))
         // TODO: write the rest
@@ -233,29 +289,30 @@ impl std::fmt::Debug for Value {
 #[repr(C)]
 pub struct ValueList {
     next: PtrOffset<ValueList>,
-    value: Value,
+    value: ValueData,
     binding: c_int,
 }
 
-impl<'a> Encoded<'a, ValueList> {
-    fn value(&self) -> Result<Encoded<'a, Value>> {
-        self.decode(std::mem::size_of_val(&self.payload.next))
+impl<'a> Ptr<'a, ValueList> {
+    fn value(&self) -> Result<Ptr<'a, ValueData>> {
+        self.decode(offset(std::mem::size_of_val(&self.payload().next) as isize))
     }
 }
 
 pub struct ValueListIter<'a> {
-    next: Option<Result<Encoded<'a, ValueList>>>,
+    next: Option<Result<Ptr<'a, ValueList>>>,
 }
 
 impl<'a> Iterator for ValueListIter<'a> {
-    type Item = Result<Encoded<'a, Value>>;
+    type Item = Result<Ptr<'a, ValueData>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(Ok(next)) = self.next.take() {
-            if next.payload.next.0 == 0 {
+            let next_payload = next.payload();
+            if next_payload.next.0 == 0 {
                 self.next = None;
             } else {
-                self.next = Some(next.decode(next.payload.next));
+                self.next = Some(next.decode(next_payload.next));
             }
             Some(next.value())
         } else if let Some(Err(e)) = self.next.take() {
@@ -278,9 +335,11 @@ pub struct Pattern {
     ref_count: c_int,
 }
 
-impl Encoded<'_, Pattern> {
-    pub fn elts(&self) -> Result<impl Iterator<Item = Encoded<PatternElt>> + '_> {
-        self.decode_array(self.payload.elts_offset, self.payload.num)
+impl Ptr<'_, Pattern> {
+    pub fn elts(&self) -> Result<impl Iterator<Item = Ptr<PatternElt>> + '_> {
+        let payload = self.payload();
+        let elts = self.decode_without_length_check(payload.elts_offset)?;
+        elts.array(payload.num)
     }
 }
 
@@ -291,10 +350,10 @@ pub struct PatternElt {
     pub values: PtrOffset<ValueList>,
 }
 
-impl Encoded<'_, PatternElt> {
-    pub fn values(&self) -> Result<impl Iterator<Item = Result<Encoded<Value>>> + '_> {
+impl Ptr<'_, PatternElt> {
+    pub fn values(&self) -> Result<impl Iterator<Item = Result<Ptr<ValueData>>> + '_> {
         Ok(ValueListIter {
-            next: Some(Ok(self.decode(self.payload.values)?)),
+            next: Some(Ok(self.decode(self.payload().values)?)),
         })
     }
 }
@@ -308,13 +367,77 @@ pub struct FontSet {
     pub fonts: PtrOffset<PtrOffset<Pattern>>,
 }
 
-impl Encoded<'_, FontSet> {
-    pub fn fonts(&self) -> Result<impl Iterator<Item = Result<Encoded<Pattern>>> + '_> {
-        let base_offset = self.offset;
-        Ok(self
-            .decode_array(self.payload.fonts, self.payload.nfont)?
-            .map(move |font_offset| font_offset.deref_offset(base_offset)))
+impl Ptr<'_, FontSet> {
+    pub fn fonts(&self) -> Result<impl Iterator<Item = Result<Ptr<Pattern>>> + '_> {
+        let payload = self.payload();
+        let fonts = self.relative_offset(payload.fonts)?.array(payload.nfont)?;
+        let me = self.clone();
+        Ok(fonts.map(move |font_offset| me.relative_offset(font_offset.payload())))
     }
+}
+
+#[derive(AnyBitPattern, Copy, Clone, Debug)]
+#[repr(C)]
+pub struct CharSet {
+    pub ref_count: c_int,
+    // Length of both of the following arrays
+    pub num: c_int,
+    // Array of offsets to leaves. Each offset is relative to the start of the array.
+    pub leaves: Offset<Offset<CharSetLeaf>>,
+    pub numbers: Offset<u16>,
+}
+
+impl<'buf> Ptr<'buf, CharSet> {
+    pub fn leaves(&self) -> Result<impl Iterator<Item = Result<Ptr<'buf, CharSetLeaf>>> + 'buf> {
+        let payload = self.payload();
+        let leaf_array = self.relative_offset(payload.leaves)?;
+        Ok(leaf_array
+            .array(payload.num)?
+            .map(move |leaf_offset| leaf_array.relative_offset(leaf_offset.payload())))
+    }
+
+    pub fn numbers(&self) -> Result<impl Iterator<Item = Ptr<'buf, u16>> + 'buf> {
+        let payload = self.payload();
+        self.relative_offset(payload.numbers)?.array(payload.num)
+    }
+
+    pub fn chunks(&self) -> Result<impl Iterator<Item = Result<CharSetChunk>> + 'buf> {
+        Ok(self.leaves()?.zip(self.numbers()?).map(|(leaf, number)| {
+            Ok(CharSetChunk {
+                offset: number.payload(),
+                map: leaf?.payload().map,
+            })
+        }))
+    }
+}
+
+#[derive(AnyBitPattern, Copy, Clone, Debug)]
+#[repr(C)]
+pub struct CharSetLeaf {
+    map: [u32; 4],
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct CharSetChunk {
+    pub offset: u16,
+    pub map: [u32; 4],
+}
+
+#[derive(AnyBitPattern, Copy, Clone, Debug)]
+#[repr(C)]
+pub struct StrSet {
+    pub ref_count: c_int,
+    pub num: c_int,
+    pub size: c_int,
+    pub strs: PtrOffset<PtrOffset<u8>>,
+    pub control: c_uint,
+}
+
+#[derive(AnyBitPattern, Copy, Clone, Debug)]
+#[repr(C)]
+pub struct LangSet {
+    extra: PtrOffset<StrSet>,
+    map_size: u32,
 }
 
 #[derive(AnyBitPattern, Copy, Clone, Debug)]
@@ -332,10 +455,16 @@ pub struct Cache {
 }
 
 #[derive(Clone)]
-pub struct Encoded<'a, S> {
+pub struct Ptr<'a, S> {
     pub offset: isize,
     pub buf: &'a [u8],
-    pub payload: S,
+    marker: std::marker::PhantomData<S>,
+}
+
+impl<'a, S> std::fmt::Debug for Ptr<'a, S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ptr").field("offset", &self.offset).finish()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -351,16 +480,16 @@ impl<'a, T> DecodeIterator<'a, T> {
         let len = std::mem::size_of::<T>();
         let total_len = len
             .checked_mul(size as usize)
-            .ok_or(CacheFormatError::BadLength(size as isize))?;
+            .ok_or(Error::BadLength(size as isize))?;
 
         if offset < 0 {
-            Err(CacheFormatError::BadOffset(offset))
+            Err(Error::BadOffset(offset))
         } else {
             let end = (offset as usize)
                 .checked_add(total_len)
-                .ok_or(CacheFormatError::BadLength(size as isize))?;
+                .ok_or(Error::BadLength(size as isize))?;
             if end > buf.len() {
-                Err(CacheFormatError::BadOffset(end as isize))
+                Err(Error::BadOffset(end as isize))
             } else {
                 Ok(DecodeIterator {
                     buf,
@@ -374,22 +503,17 @@ impl<'a, T> DecodeIterator<'a, T> {
 }
 
 impl<'a, T: AnyBitPattern> Iterator for DecodeIterator<'a, T> {
-    type Item = Encoded<'a, T>;
+    type Item = Ptr<'a, T>;
 
-    fn next(&mut self) -> Option<Encoded<'a, T>> {
+    fn next(&mut self) -> Option<Ptr<'a, T>> {
         if self.remaining <= 0 {
             None
         } else {
             let len = std::mem::size_of::<T>();
-            // We checked at construction time that the buffer has enough elements for the whole
-            // iterator, so the slice will succeed.
-            let payload =
-                bytemuck::try_pod_read_unaligned(&self.buf[self.offset..(self.offset + len)])
-                    .expect("but we checked the length...");
-            let ret = Encoded {
+            let ret = Ptr {
                 buf: self.buf,
                 offset: self.offset as isize,
-                payload,
+                marker: std::marker::PhantomData,
             };
             self.offset += len;
             self.remaining -= 1;
@@ -398,58 +522,92 @@ impl<'a, T: AnyBitPattern> Iterator for DecodeIterator<'a, T> {
     }
 }
 
-impl<'a, S> Encoded<'a, S> {
-    pub fn offset<T: AnyBitPattern>(&self, offset: impl IntoOffset<T>) -> Result<isize> {
-        let offset = offset.into_offset()?;
-        self.offset
-            .checked_add(offset.0)
-            .ok_or(CacheFormatError::BadOffset(offset.0))
-    }
-
-    pub fn decode<T: AnyBitPattern>(&self, offset: impl IntoOffset<T>) -> Result<Encoded<'a, T>> {
-        let offset = self.offset(offset)?;
-        let len = std::mem::size_of::<T>() as isize;
-        if offset < 0 || len + offset > self.buf.len() as isize {
-            Err(CacheFormatError::BadOffset(offset))
-        } else {
-            let payload = bytemuck::try_pod_read_unaligned(
-                &self.buf[(offset as usize)..((offset + len) as usize)],
-            )
-            .expect("but we checked the length...");
-            Ok(Encoded {
-                buf: self.buf,
-                offset,
-                payload,
-            })
-        }
-    }
-
-    pub fn decode_str(&self, offset: impl IntoOffset<u8>) -> Result<&'a [u8]> {
-        let offset = self.offset(offset)?;
+impl<'buf> Ptr<'buf, u8> {
+    pub fn str(&self) -> Result<&'buf [u8]> {
+        let offset = self.offset;
         if offset < 0 || offset > self.buf.len() as isize {
-            Err(CacheFormatError::BadOffset(offset))
+            Err(Error::BadOffset(offset))
         } else {
             let buf = &self.buf[(offset as usize)..];
             let null_offset = buf
                 .iter()
                 .position(|&c| c == 0)
-                .ok_or(CacheFormatError::UnterminatedString(offset))?;
+                .ok_or(Error::UnterminatedString(offset))?;
             Ok(&buf[..null_offset])
         }
     }
+}
 
-    fn decode_array<T: AnyBitPattern>(
+impl<'a, S: AnyBitPattern> Ptr<'a, S> {
+    pub fn offset<T: AnyBitPattern>(&self, offset: impl IntoOffset<Item = T>) -> Result<isize> {
+        let offset = offset.into_offset()?;
+        self.offset
+            .checked_add(offset.0)
+            .ok_or(Error::BadOffset(offset.0))
+    }
+
+    pub fn relative_offset<Off: IntoOffset>(&self, offset: Off) -> Result<Ptr<'a, Off::Item>> {
+        let offset = offset.into_offset()?;
+        Ok(Ptr {
+            buf: self.buf,
+            offset: self
+                .offset
+                .checked_add(offset.0)
+                .ok_or(Error::BadOffset(offset.0))?,
+            marker: std::marker::PhantomData,
+        })
+    }
+
+    pub fn payload(&self) -> S {
+        let len = std::mem::size_of::<S>() as isize;
+        // We checked at construction time that the buffer has enough elements for the payload,
+        // so the slice will succeed.
+        bytemuck::try_pod_read_unaligned(
+            &self.buf[(self.offset as usize)..((self.offset + len) as usize)],
+        )
+        .expect("but we checked the length...")
+    }
+
+    pub fn decode<T: AnyBitPattern>(
         &self,
-        offset: impl IntoOffset<T>,
-        count: c_int,
-    ) -> Result<impl Iterator<Item = Encoded<T>>> {
+        offset: impl IntoOffset<Item = T>,
+    ) -> Result<Ptr<'a, T>> {
+        let len = std::mem::size_of::<T>() as isize;
         let offset = self.offset(offset)?;
-        Ok(DecodeIterator::new(self.buf, offset, count)?)
+        if offset < 0 || len + offset > self.buf.len() as isize {
+            Err(Error::BadOffset(offset))
+        } else {
+            Ok(Ptr {
+                buf: self.buf,
+                offset,
+                marker: std::marker::PhantomData,
+            })
+        }
+    }
+
+    fn decode_without_length_check<T: AnyBitPattern>(
+        &self,
+        offset: impl IntoOffset<Item = T>,
+    ) -> Result<Ptr<'a, T>> {
+        let offset = self.offset(offset)?;
+        if offset < 0 {
+            Err(Error::BadOffset(offset))
+        } else {
+            Ok(Ptr {
+                buf: self.buf,
+                offset,
+                marker: std::marker::PhantomData,
+            })
+        }
+    }
+
+    fn array(&self, count: c_int) -> Result<impl Iterator<Item = Ptr<'a, S>> + 'a> {
+        Ok(DecodeIterator::new(self.buf, self.offset, count)?)
     }
 }
 
 #[derive(Clone, Debug, thiserror::Error)]
-pub enum CacheFormatError {
+pub enum Error {
     #[error("Invalid magic number {0:#x}")]
     BadMagic(c_uint),
 
@@ -479,8 +637,8 @@ pub enum CacheFormatError {
 }
 
 impl Cache {
-    pub fn read(buf: &[u8]) -> Result<Encoded<'_, Cache>> {
-        use CacheFormatError::*;
+    pub fn read(buf: &[u8]) -> Result<Ptr<'_, Cache>> {
+        use Error::*;
 
         let len = std::mem::size_of::<Cache>();
         if buf.len() < len {
@@ -502,13 +660,18 @@ impl Cache {
                     actual: buf.len() as isize,
                 })
             } else {
-                Ok(Encoded {
+                Ok(Ptr {
                     buf,
                     offset: 0,
-                    payload: bytemuck::try_pod_read_unaligned(&buf[0..len])
-                        .expect("but we checked the length..."),
+                    marker: std::marker::PhantomData,
                 })
             }
         }
+    }
+}
+
+impl<'buf> Ptr<'buf, Cache> {
+    pub fn set(&self) -> Result<Ptr<'buf, FontSet>> {
+        self.decode(self.payload().set)
     }
 }
