@@ -24,22 +24,22 @@ union ValueUnion {
 
 /// A wrapper around fontconfig's `FcValue` type.
 #[derive(Clone, Debug)]
-pub enum Value<'a> {
+pub enum Value<'buf> {
     Unknown,
     Void,
     Int(c_int),
     Float(f64),
-    String(Ptr<'a, u8>),
+    String(Ptr<'buf, u8>),
     Bool(c_int),
     /// Not yet supported
-    Matrix(Ptr<'a, ()>),
-    CharSet(Ptr<'a, CharSet>),
+    Matrix(Ptr<'buf, ()>),
+    CharSet(Ptr<'buf, CharSet>),
     /// Not yet supported
-    FtFace(Ptr<'a, ()>),
+    FtFace(Ptr<'buf, ()>),
     /// Not yet supported
-    LangSet(Ptr<'a, ()>),
+    LangSet(Ptr<'buf, ()>),
     /// Not yet supported
-    Range(Ptr<'a, ()>),
+    Range(Ptr<'buf, ()>),
 }
 
 #[derive(AnyBitPattern, Copy, Clone)]
@@ -49,11 +49,11 @@ pub struct ValueData {
     val: ValueUnion,
 }
 
-impl<'a> Ptr<'a, ValueData> {
-    /// Converts the raw
-    pub fn to_value(&self) -> Result<Value<'a>> {
+impl<'buf> Ptr<'buf, ValueData> {
+    /// Converts the raw C representation to an enum.
+    pub fn to_value(&self) -> Result<Value<'buf>> {
         use Value::*;
-        let payload = self.payload()?;
+        let payload = self.deref()?;
 
         unsafe {
             Ok(match payload.ty {
@@ -263,23 +263,23 @@ pub struct ValueList {
     binding: c_int,
 }
 
-impl<'a> Ptr<'a, ValueList> {
-    fn value(&self) -> Result<Ptr<'a, ValueData>> {
-        self.relative_offset(offset(std::mem::size_of_val(&self.payload()?.next) as isize))
+impl<'buf> Ptr<'buf, ValueList> {
+    fn value(&self) -> Result<Ptr<'buf, ValueData>> {
+        self.relative_offset(offset(std::mem::size_of_val(&self.deref()?.next) as isize))
     }
 }
 
-pub struct ValueListIter<'a> {
-    next: Option<Result<Ptr<'a, ValueList>>>,
+pub struct ValueListIter<'buf> {
+    next: Option<Result<Ptr<'buf, ValueList>>>,
 }
 
-impl<'a> Iterator for ValueListIter<'a> {
-    type Item = Result<Ptr<'a, ValueData>>;
+impl<'buf> Iterator for ValueListIter<'buf> {
+    type Item = Result<Ptr<'buf, ValueData>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let next = self.next.take();
         if let Some(Ok(next)) = next {
-            match next.payload() {
+            match next.deref() {
                 Ok(next_payload) => {
                     if next_payload.next.0 == 0 {
                         self.next = None;
@@ -314,7 +314,7 @@ pub struct Pattern {
 
 impl Ptr<'_, Pattern> {
     pub fn elts(&self) -> Result<impl Iterator<Item = Ptr<PatternElt>> + '_> {
-        let payload = self.payload()?;
+        let payload = self.deref()?;
         let elts = self.relative_offset(payload.elts_offset)?;
         elts.array(payload.num)
     }
@@ -330,7 +330,7 @@ pub struct PatternElt {
 impl Ptr<'_, PatternElt> {
     pub fn values(&self) -> Result<impl Iterator<Item = Result<Ptr<ValueData>>> + '_> {
         Ok(ValueListIter {
-            next: Some(Ok(self.relative_offset(self.payload()?.values)?)),
+            next: Some(Ok(self.relative_offset(self.deref()?.values)?)),
         })
     }
 }
@@ -346,10 +346,10 @@ pub struct FontSet {
 
 impl Ptr<'_, FontSet> {
     pub fn fonts(&self) -> Result<impl Iterator<Item = Result<Ptr<Pattern>>> + '_> {
-        let payload = self.payload()?;
+        let payload = self.deref()?;
         let fonts = self.relative_offset(payload.fonts)?.array(payload.nfont)?;
         let me = self.clone();
-        Ok(fonts.map(move |font_offset| me.relative_offset(font_offset.payload()?)))
+        Ok(fonts.map(move |font_offset| me.relative_offset(font_offset.deref()?)))
     }
 }
 
@@ -366,23 +366,23 @@ pub struct CharSet {
 
 impl<'buf> Ptr<'buf, CharSet> {
     pub fn leaves(&self) -> Result<impl Iterator<Item = Result<Ptr<'buf, CharSetLeaf>>> + 'buf> {
-        let payload = self.payload()?;
+        let payload = self.deref()?;
         let leaf_array = self.relative_offset(payload.leaves)?;
         Ok(leaf_array
             .array(payload.num)?
-            .map(move |leaf_offset| leaf_array.relative_offset(leaf_offset.payload()?)))
+            .map(move |leaf_offset| leaf_array.relative_offset(leaf_offset.deref()?)))
     }
 
     pub fn numbers(&self) -> Result<impl Iterator<Item = Ptr<'buf, u16>> + 'buf> {
-        let payload = self.payload()?;
+        let payload = self.deref()?;
         self.relative_offset(payload.numbers)?.array(payload.num)
     }
 
     pub fn chunks(&self) -> Result<impl Iterator<Item = Result<CharSetChunk>> + 'buf> {
         Ok(self.leaves()?.zip(self.numbers()?).map(|(leaf, number)| {
             Ok(CharSetChunk {
-                offset: number.payload()?,
-                map: leaf?.payload()?.map,
+                offset: number.deref()?,
+                map: leaf?.deref()?.map,
             })
         }))
     }
@@ -391,13 +391,13 @@ impl<'buf> Ptr<'buf, CharSet> {
 #[derive(AnyBitPattern, Copy, Clone, Debug)]
 #[repr(C)]
 pub struct CharSetLeaf {
-    map: [u32; 4],
+    map: [u32; 8],
 }
 
 #[derive(Copy, Clone, Debug)]
 pub struct CharSetChunk {
     pub offset: u16,
-    pub map: [u32; 4],
+    pub map: [u32; 8],
 }
 
 #[derive(AnyBitPattern, Copy, Clone, Debug)]
@@ -431,29 +431,30 @@ pub struct Cache {
     pub checksum_nano: c_int,
 }
 
+/// A reference to a fontconfig struct that's been serialized in a buffer.
 #[derive(Clone)]
-pub struct Ptr<'a, S> {
+pub struct Ptr<'buf, S> {
     pub offset: isize,
-    pub buf: &'a [u8],
+    pub buf: &'buf [u8],
     marker: std::marker::PhantomData<S>,
 }
 
-impl<'a, S> std::fmt::Debug for Ptr<'a, S> {
+impl<'buf, S> std::fmt::Debug for Ptr<'buf, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Ptr").field("offset", &self.offset).finish()
     }
 }
 
 #[derive(Clone, Debug)]
-struct DecodeIterator<'a, T> {
-    buf: &'a [u8],
+struct DecodeIterator<'buf, T> {
+    buf: &'buf [u8],
     offset: usize,
     remaining: isize,
     marker: std::marker::PhantomData<T>,
 }
 
-impl<'a, T> DecodeIterator<'a, T> {
-    fn new(buf: &'a [u8], offset: isize, size: c_int) -> Result<Self> {
+impl<'buf, T> DecodeIterator<'buf, T> {
+    fn new(buf: &'buf [u8], offset: isize, size: c_int) -> Result<Self> {
         let len = std::mem::size_of::<T>();
         let total_len = len
             .checked_mul(size as usize)
@@ -479,10 +480,10 @@ impl<'a, T> DecodeIterator<'a, T> {
     }
 }
 
-impl<'a, T: AnyBitPattern> Iterator for DecodeIterator<'a, T> {
-    type Item = Ptr<'a, T>;
+impl<'buf, T: AnyBitPattern> Iterator for DecodeIterator<'buf, T> {
+    type Item = Ptr<'buf, T>;
 
-    fn next(&mut self) -> Option<Ptr<'a, T>> {
+    fn next(&mut self) -> Option<Ptr<'buf, T>> {
         if self.remaining <= 0 {
             None
         } else {
@@ -500,6 +501,8 @@ impl<'a, T: AnyBitPattern> Iterator for DecodeIterator<'a, T> {
 }
 
 impl<'buf> Ptr<'buf, u8> {
+    /// Assuming that this `Ptr<u8>` is pointing to the beginning of a null-terminated string,
+    /// return that string.
     pub fn str(&self) -> Result<&'buf [u8]> {
         let offset = self.offset;
         if offset < 0 || offset > self.buf.len() as isize {
@@ -515,8 +518,15 @@ impl<'buf> Ptr<'buf, u8> {
     }
 }
 
-impl<'a, S: AnyBitPattern> Ptr<'a, S> {
-    pub fn relative_offset<Off: IntoOffset>(&self, offset: Off) -> Result<Ptr<'a, Off::Item>> {
+impl<'buf, S: AnyBitPattern> Ptr<'buf, S> {
+    /// Turn `offset` into a pointer, assuming that it's an offset relative to this pointer.
+    ///
+    /// In order to be certain about which offsets are relative to what, you'll need to check
+    /// the fontconfig source. But generally, offsets stored in a struct are relative to the
+    /// base address of that struct. So for example, to access the `dir` field in
+    /// [`Cache`](crate::Cache) you could call `cache.relative_offset(cache.deref()?.dir)?`.
+    /// This will give you a `Ptr<u8>` pointing to the start of the directory name.
+    pub fn relative_offset<Off: IntoOffset>(&self, offset: Off) -> Result<Ptr<'buf, Off::Item>> {
         let offset = offset.into_offset()?;
         Ok(Ptr {
             buf: self.buf,
@@ -528,7 +538,8 @@ impl<'a, S: AnyBitPattern> Ptr<'a, S> {
         })
     }
 
-    pub fn payload(&self) -> Result<S> {
+    /// "Dereference" this pointer, returning a plain struct.
+    pub fn deref(&self) -> Result<S> {
         let len = std::mem::size_of::<S>() as isize;
         if self.offset + len >= self.buf.len() as isize {
             Err(Error::BadOffset(self.offset))
@@ -542,7 +553,9 @@ impl<'a, S: AnyBitPattern> Ptr<'a, S> {
         }
     }
 
-    fn array(&self, count: c_int) -> Result<impl Iterator<Item = Ptr<'a, S>> + 'a> {
+    /// Treating this pointer as a reference to the start of an array of length `count`,
+    /// return an iterator over that array.
+    fn array(&self, count: c_int) -> Result<impl Iterator<Item = Ptr<'buf, S>> + 'buf> {
         Ok(DecodeIterator::new(self.buf, self.offset, count)?)
     }
 }
@@ -578,7 +591,8 @@ pub enum Error {
 }
 
 impl Cache {
-    pub fn read(buf: &[u8]) -> Result<Ptr<'_, Cache>> {
+    /// Read a cache from a slice of bytes.
+    pub fn from_bytes(buf: &[u8]) -> Result<Ptr<'_, Cache>> {
         use Error::*;
 
         let len = std::mem::size_of::<Cache>();
@@ -612,7 +626,8 @@ impl Cache {
 }
 
 impl<'buf> Ptr<'buf, Cache> {
+    /// The [`FontSet`](crate::FontSet) stored in this cache.
     pub fn set(&self) -> Result<Ptr<'buf, FontSet>> {
-        self.relative_offset(self.payload()?.set)
+        self.relative_offset(self.deref()?.set)
     }
 }
