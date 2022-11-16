@@ -30,8 +30,8 @@ fn main() -> anyhow::Result<()> {
                 if let fontconfig_cache_parser::Value::String(s) = val {
                     println!("string value: {:?}", String::from_utf8_lossy(s.str()?));
                 } else if let fontconfig_cache_parser::Value::CharSet(cs) = val {
-                    for chunk in cs.chunks()? {
-                        println!("char set chunk: {:?}", chunk);
+                    for ch in cs.chars()? {
+                        println!("char {:x}", ch?);
                     }
                 } else {
                     println!("val {:?}", val);

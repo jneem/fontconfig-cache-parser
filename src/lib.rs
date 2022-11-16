@@ -378,26 +378,116 @@ impl<'buf> Ptr<'buf, CharSet> {
         self.relative_offset(payload.numbers)?.array(payload.num)
     }
 
-    pub fn chunks(&self) -> Result<impl Iterator<Item = Result<CharSetChunk>> + 'buf> {
-        Ok(self.leaves()?.zip(self.numbers()?).map(|(leaf, number)| {
-            Ok(CharSetChunk {
-                offset: number.deref()?,
-                map: leaf?.deref()?.map,
-            })
+    pub fn numbers_array(&self) -> Result<&'buf [u16]> {
+        let payload = self.deref()?;
+        let first_num = self.relative_offset(payload.numbers)?;
+        let offset = first_num.offset as usize;
+        let len_in_bytes = payload.num as usize * 2;
+
+        if (offset & 1) != 0
+            || offset
+                .checked_add(len_in_bytes)
+                .map(|off| off <= first_num.buf.len())
+                != Some(true)
+        {
+            return Err(Error::BadOffset(offset as isize));
+        }
+
+        // We've checked alignment and length, so the next two lines will both succeed.
+        let slice = &first_num.buf[offset..(offset + len_in_bytes)];
+        Ok(bytemuck::cast_slice(slice))
+    }
+
+    pub fn chars(&self) -> Result<impl Iterator<Item = Result<u32>> + 'buf> {
+        // TODO: this iterator-mangling is super-grungy and shouldn't allocate.
+        // This would be super easy to write using generators; the main issue is that
+        // the early-return-on-decode errors make the control flow tricky to express
+        // with combinators and closures.
+        fn transpose_result_iter<T: 'static, I: Iterator<Item = T> + 'static>(
+            res: Result<I>,
+        ) -> impl Iterator<Item = Result<T>> {
+            match res {
+                Ok(iter) => Box::new(iter.map(|x| Ok(x))) as Box<dyn Iterator<Item = Result<T>>>,
+                Err(e) => Box::new(Some(Err(e)).into_iter()) as Box<dyn Iterator<Item = Result<T>>>,
+            }
+        }
+
+        let leaves = self.leaves()?;
+        let numbers = self.numbers()?;
+        Ok(leaves.zip(numbers).flat_map(|(maybe_leaf, number)| {
+            let iter = (move || {
+                let number = (number.deref()? as u32) << 8;
+                let leaf = maybe_leaf?.deref()?;
+                Ok(leaf.iter().map(move |x| x as u32 + number))
+            })();
+            transpose_result_iter(iter)
         }))
+    }
+
+    pub fn leaf_at(&self, idx: usize) -> Result<Ptr<'buf, CharSetLeaf>> {
+        todo!()
+    }
+
+    pub fn contains(&self, ch: u32) -> Result<bool> {
+        let hi = ((ch >> 8) & 0xffff) as u16;
+        let lo = (ch & 0xff) as u8;
+        match self.numbers_array()?.binary_search(&hi) {
+            Ok(idx) => Ok(self.leaf_at(idx)?.deref()?.contains_byte(lo)),
+            Err(_) => Ok(false),
+        }
     }
 }
 
+/// A set of bytes, represented as a bitset.
 #[derive(AnyBitPattern, Copy, Clone, Debug)]
 #[repr(C)]
 pub struct CharSetLeaf {
     map: [u32; 8],
 }
 
-#[derive(Copy, Clone, Debug)]
-pub struct CharSetChunk {
-    pub offset: u16,
-    pub map: [u32; 8],
+impl CharSetLeaf {
+    /// Checks whether the bitset part of this chunk contains the given byte.
+    pub fn contains_byte(&self, byte: u8) -> bool {
+        let map_idx = (byte >> 5) as usize;
+        let bit_idx = (byte & 0x1f) as u32;
+
+        (self.map[map_idx] >> bit_idx) & 1 != 0
+    }
+
+    pub fn iter(self) -> CharSetLeafIter {
+        CharSetLeafIter {
+            leaf: self,
+            map_idx: 0,
+        }
+    }
+}
+
+pub struct CharSetLeafIter {
+    leaf: CharSetLeaf,
+    map_idx: u8,
+}
+
+impl Iterator for CharSetLeafIter {
+    type Item = u8;
+
+    fn next(&mut self) -> Option<u8> {
+        let len = self.leaf.map.len() as u8;
+        if self.map_idx >= len {
+            None
+        } else {
+            let bits = &mut self.leaf.map[self.map_idx as usize];
+            if *bits != 0 {
+                let ret = bits.trailing_zeros() as u8;
+                *bits &= !(1 << ret);
+                Some(ret + (self.map_idx << 5))
+            } else {
+                while self.map_idx < len && self.leaf.map[self.map_idx as usize] == 0 {
+                    self.map_idx += 1;
+                }
+                self.next()
+            }
+        }
+    }
 }
 
 #[derive(AnyBitPattern, Copy, Clone, Debug)]
