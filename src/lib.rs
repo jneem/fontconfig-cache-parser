@@ -373,29 +373,9 @@ impl<'buf> Ptr<'buf, CharSet> {
             .map(move |leaf_offset| leaf_array.relative_offset(leaf_offset.deref()?)))
     }
 
-    pub fn numbers(&self) -> Result<impl Iterator<Item = Ptr<'buf, u16>> + 'buf> {
+    pub fn numbers(&self) -> Result<Array<'buf, u16>> {
         let payload = self.deref()?;
         self.relative_offset(payload.numbers)?.array(payload.num)
-    }
-
-    pub fn numbers_array(&self) -> Result<&'buf [u16]> {
-        let payload = self.deref()?;
-        let first_num = self.relative_offset(payload.numbers)?;
-        let offset = first_num.offset as usize;
-        let len_in_bytes = payload.num as usize * 2;
-
-        if (offset & 1) != 0
-            || offset
-                .checked_add(len_in_bytes)
-                .map(|off| off <= first_num.buf.len())
-                != Some(true)
-        {
-            return Err(Error::BadOffset(offset as isize));
-        }
-
-        // We've checked alignment and length, so the next two lines will both succeed.
-        let slice = &first_num.buf[offset..(offset + len_in_bytes)];
-        Ok(bytemuck::cast_slice(slice))
     }
 
     pub fn chars(&self) -> Result<impl Iterator<Item = Result<u32>> + 'buf> {
@@ -424,15 +404,22 @@ impl<'buf> Ptr<'buf, CharSet> {
         }))
     }
 
-    pub fn leaf_at(&self, idx: usize) -> Result<Ptr<'buf, CharSetLeaf>> {
-        todo!()
+    pub fn leaf_at(&self, idx: usize) -> Result<Option<Ptr<'buf, CharSetLeaf>>> {
+        let payload = self.deref()?;
+        let leaf_array = self.relative_offset(payload.leaves)?;
+        leaf_array
+            .array(payload.num)?
+            .get(idx)
+            .map(|ptr| leaf_array.relative_offset(ptr.deref()?))
+            .transpose()
     }
 
     pub fn contains(&self, ch: u32) -> Result<bool> {
         let hi = ((ch >> 8) & 0xffff) as u16;
         let lo = (ch & 0xff) as u8;
-        match self.numbers_array()?.binary_search(&hi) {
-            Ok(idx) => Ok(self.leaf_at(idx)?.deref()?.contains_byte(lo)),
+        match self.numbers()?.as_slice()?.binary_search(&hi) {
+            // The unwrap will succeed because numbers and leaves have the same length.
+            Ok(idx) => Ok(self.leaf_at(idx)?.unwrap().deref()?.contains_byte(lo)),
             Err(_) => Ok(false),
         }
     }
@@ -536,14 +523,14 @@ impl<'buf, S> std::fmt::Debug for Ptr<'buf, S> {
 }
 
 #[derive(Clone, Debug)]
-struct DecodeIterator<'buf, T> {
+pub struct Array<'buf, T> {
     buf: &'buf [u8],
     offset: usize,
-    remaining: isize,
+    size: isize,
     marker: std::marker::PhantomData<T>,
 }
 
-impl<'buf, T> DecodeIterator<'buf, T> {
+impl<'buf, T: AnyBitPattern> Array<'buf, T> {
     fn new(buf: &'buf [u8], offset: isize, size: c_int) -> Result<Self> {
         let len = std::mem::size_of::<T>();
         let total_len = len
@@ -559,22 +546,47 @@ impl<'buf, T> DecodeIterator<'buf, T> {
             if end > buf.len() {
                 Err(Error::BadOffset(end as isize))
             } else {
-                Ok(DecodeIterator {
+                Ok(Array {
                     buf,
                     offset: offset as usize,
-                    remaining: size as isize,
+                    size: size as isize,
                     marker: std::marker::PhantomData,
                 })
             }
         }
     }
+
+    pub fn get(&self, idx: usize) -> Option<Ptr<'buf, T>> {
+        if (idx as isize) < self.size {
+            let len = std::mem::size_of::<T>() as isize;
+            Some(Ptr {
+                buf: self.buf,
+                offset: self.offset as isize + (idx as isize) * len,
+                marker: std::marker::PhantomData,
+            })
+        } else {
+            None
+        }
+    }
+
+    // Only possible failure is that the alignment is wrong, because
+    // size checks were done at construction time.
+    pub fn as_slice(&self) -> Result<&'buf [T]> {
+        let len = std::mem::size_of::<T>() * self.size as usize;
+        bytemuck::try_cast_slice(&self.buf[self.offset..(self.offset + len)]).map_err(|_| {
+            Error::BadAlignment {
+                offset: self.offset,
+                expected_alignment: std::mem::align_of::<T>(),
+            }
+        })
+    }
 }
 
-impl<'buf, T: AnyBitPattern> Iterator for DecodeIterator<'buf, T> {
+impl<'buf, T: AnyBitPattern> Iterator for Array<'buf, T> {
     type Item = Ptr<'buf, T>;
 
     fn next(&mut self) -> Option<Ptr<'buf, T>> {
-        if self.remaining <= 0 {
+        if self.size <= 0 {
             None
         } else {
             let len = std::mem::size_of::<T>();
@@ -584,7 +596,7 @@ impl<'buf, T: AnyBitPattern> Iterator for DecodeIterator<'buf, T> {
                 marker: std::marker::PhantomData,
             };
             self.offset += len;
-            self.remaining -= 1;
+            self.size -= 1;
             Some(ret)
         }
     }
@@ -645,8 +657,8 @@ impl<'buf, S: AnyBitPattern> Ptr<'buf, S> {
 
     /// Treating this pointer as a reference to the start of an array of length `count`,
     /// return an iterator over that array.
-    fn array(&self, count: c_int) -> Result<impl Iterator<Item = Ptr<'buf, S>> + 'buf> {
-        Ok(DecodeIterator::new(self.buf, self.offset, count)?)
+    fn array(&self, count: c_int) -> Result<Array<'buf, S>> {
+        Ok(Array::new(self.buf, self.offset, count)?)
     }
 }
 
@@ -663,6 +675,12 @@ pub enum Error {
 
     #[error("Bad offset {0}")]
     BadOffset(isize),
+
+    #[error("Bad alignment (expected {expected_alignment}) for offset {offset}")]
+    BadAlignment {
+        expected_alignment: usize,
+        offset: usize,
+    },
 
     #[error("Bad length {0}")]
     BadLength(isize),

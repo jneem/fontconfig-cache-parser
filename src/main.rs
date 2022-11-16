@@ -33,6 +33,9 @@ fn main() -> anyhow::Result<()> {
                     for ch in cs.chars()? {
                         println!("char {:x}", ch?);
                     }
+
+                    println!("contains 0x63b? {}", cs.contains(0x63b)?);
+                    println!("contains 0x6b5? {}", cs.contains(0x6b5)?);
                 } else {
                     println!("val {:?}", val);
                 }
