@@ -584,6 +584,11 @@ impl<'buf, T: AnyBitPattern> Array<'buf, T> {
         self.size as usize
     }
 
+    /// Is this array empty?
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Retrieve an element at a given index, if that index isn't too big.
     pub fn get(&self, idx: usize) -> Option<Ptr<'buf, T>> {
         if (idx as isize) < self.size {
@@ -689,7 +694,7 @@ impl<'buf, S: AnyBitPattern> Ptr<'buf, S> {
     /// Treating this pointer as a reference to the start of an array of length `count`,
     /// return an iterator over that array.
     fn array(&self, count: c_int) -> Result<Array<'buf, S>> {
-        Ok(Array::new(self.buf, self.offset, count)?)
+        Array::new(self.buf, self.offset, count)
     }
 }
 
