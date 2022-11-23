@@ -1,3 +1,4 @@
+// TODO: make this an example, not a main.
 use clap::Parser;
 use std::path::PathBuf;
 

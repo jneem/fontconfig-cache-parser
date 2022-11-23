@@ -1,3 +1,14 @@
+//! A crate for parsing fontconfig cache files.
+//!
+//! The fontconfig cache format is a C-style binary format, containing a maze of twisty structs all alike,
+//! with lots of pointers from one to another. This makes it pretty inefficient to parse the whole file,
+//! especially if you're only interested in a few parts. The expected workflow of this crate is:
+//!
+//! 1. You read the cache file into memory (possibly using `mmap` if the file is large and performance is important).
+//! 2. You construct a [`Ptr<Cache>`](crate::Cache::from_bytes), borrowing the memory chunk.
+//! 3. You follow the various methods on `Ptr<Cache>` to get `Ptr<SomethingElse>`, and extract the information
+//!   you want like that.
+
 use bytemuck::AnyBitPattern;
 use std::os::raw::{c_int, c_uint};
 
@@ -186,6 +197,8 @@ impl<T: AnyBitPattern + Copy> IntoOffset for Offset<T> {
 
 /// A relative offset to another struct in the cache.
 ///
+/// # Implementation details
+///
 /// Fontconfig's cache is stuctured as a collection of structs.
 /// These structs are encoded in the cache by
 /// writing their bytes into a cache file. (So the format is architecture-dependent.)
@@ -223,6 +236,7 @@ impl<T: AnyBitPattern + Copy> IntoOffset for Offset<T> {
 ///     FcObject object;
 ///     FcValueList *values;
 /// }
+/// ```
 ///
 /// In this case, fontconfig actually handles two cases: if the lowest-order bit of `values` is 0
 /// it's treated as a normal pointer, but if the lowest-order bit is 1 then that bit is set
@@ -339,7 +353,7 @@ impl Ptr<'_, PatternElt> {
 #[repr(C)]
 pub struct FontSet {
     pub nfont: c_int,
-    // FIXME: what's this?
+    // FIXME: what's this? Capacity?
     pub sfont: c_int,
     pub fonts: PtrOffset<PtrOffset<Pattern>>,
 }
@@ -378,6 +392,7 @@ impl<'buf> Ptr<'buf, CharSet> {
         self.relative_offset(payload.numbers)?.array(payload.num)
     }
 
+    /// Creates an iterator over the codepoints in this charset.
     pub fn chars(&self) -> Result<impl Iterator<Item = Result<u32>> + 'buf> {
         // TODO: this iterator-mangling is super-grungy and shouldn't allocate.
         // This would be super easy to write using generators; the main issue is that
@@ -414,6 +429,7 @@ impl<'buf> Ptr<'buf, CharSet> {
             .transpose()
     }
 
+    /// Checks whether this charset contains a given codepoint.
     pub fn contains(&self, ch: u32) -> Result<bool> {
         let hi = ((ch >> 8) & 0xffff) as u16;
         let lo = (ch & 0xff) as u8;
@@ -494,6 +510,12 @@ pub struct LangSet {
     map_size: u32,
 }
 
+/// The fontconfig cache header.
+///
+/// This is just the plain old data in the header. If you want to actually access any other parts
+/// of the cache file, you'll need to look at [`Ptr<Cache>`](crate::Ptr), which represents the
+/// header in the context of the rest of the cache. (I know this is annoying;
+/// I haven't figured out how to make rustdoc organize it nicely.)
 #[derive(AnyBitPattern, Copy, Clone, Debug)]
 #[repr(C)]
 pub struct Cache {
@@ -522,6 +544,7 @@ impl<'buf, S> std::fmt::Debug for Ptr<'buf, S> {
     }
 }
 
+/// A reference to an array of serialized fontconfig structs.
 #[derive(Clone, Debug)]
 pub struct Array<'buf, T> {
     buf: &'buf [u8],
@@ -556,6 +579,12 @@ impl<'buf, T: AnyBitPattern> Array<'buf, T> {
         }
     }
 
+    /// The number of elements in this array.
+    pub fn len(&self) -> usize {
+        self.size as usize
+    }
+
+    /// Retrieve an element at a given index, if that index isn't too big.
     pub fn get(&self, idx: usize) -> Option<Ptr<'buf, T>> {
         if (idx as isize) < self.size {
             let len = std::mem::size_of::<T>() as isize;
@@ -569,8 +598,10 @@ impl<'buf, T: AnyBitPattern> Array<'buf, T> {
         }
     }
 
-    // Only possible failure is that the alignment is wrong, because
-    // size checks were done at construction time.
+    /// View this array as a rust slice.
+    ///
+    /// This conversion might fail if the alignment is wrong. That definitely won't happen if `T` has
+    /// a two-byte alignment. It's *probably* fine in general, but don't blame me if it isn't.
     pub fn as_slice(&self) -> Result<&'buf [T]> {
         let len = std::mem::size_of::<T>() * self.size as usize;
         bytemuck::try_cast_slice(&self.buf[self.offset..(self.offset + len)]).map_err(|_| {
@@ -662,6 +693,7 @@ impl<'buf, S: AnyBitPattern> Ptr<'buf, S> {
     }
 }
 
+/// All the possible errors we can encounter when parsing the cache file.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
     #[error("Invalid magic number {0:#x}")]
