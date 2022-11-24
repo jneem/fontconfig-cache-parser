@@ -367,18 +367,35 @@ impl Ptr<'_, FontSet> {
     }
 }
 
+/// A set of code points.
+///
+/// This struct is just the plain old data stored in the cache. To access
+/// this set, look at [`Ptr<CharSet>`](crate::Ptr), which represents the char set
+/// in the context of the cache file.
+///
+/// # Implementation details
+///
+/// This charset is implemented as a bunch of bitsets. Each bitset (a [`CharSetLeaf`](crate::CharSetLeaf))
+/// has 256 bits, and so it represents the least significant byte of the codepoint. Associated to each
+/// leaf is a 16-bit offset, representing the next two least-significant bytes of the codepoint.
+/// (In particular, this can represent any subset of the numbers `0` through `0x00FFFFFF`, which is
+/// big enough for the unicode range.)
 #[derive(AnyBitPattern, Copy, Clone, Debug)]
 #[repr(C)]
 pub struct CharSet {
-    pub ref_count: c_int,
-    // Length of both of the following arrays
+    // Reference count. Not interesting for us.
+    ref_count: c_int,
+    /// Length of both of the following arrays
     pub num: c_int,
-    // Array of offsets to leaves. Each offset is relative to the start of the array.
+    /// Array of offsets to leaves. Each offset is relative to the start of the array, not the
+    /// start of this struct!
     pub leaves: Offset<Offset<CharSetLeaf>>,
+    /// Array having the same length as `leaves`, and storing the 16-bit offsets of each leaf.
     pub numbers: Offset<u16>,
 }
 
 impl<'buf> Ptr<'buf, CharSet> {
+    /// Returns an iterator over the leaf bitsets.
     pub fn leaves(&self) -> Result<impl Iterator<Item = Result<Ptr<'buf, CharSetLeaf>>> + 'buf> {
         let payload = self.deref()?;
         let leaf_array = self.relative_offset(payload.leaves)?;
@@ -387,6 +404,7 @@ impl<'buf> Ptr<'buf, CharSet> {
             .map(move |leaf_offset| leaf_array.relative_offset(leaf_offset.deref()?)))
     }
 
+    /// Returns an iterator over the 16-bit leaf offsets.
     pub fn numbers(&self) -> Result<Array<'buf, u16>> {
         let payload = self.deref()?;
         self.relative_offset(payload.numbers)?.array(payload.num)
@@ -445,11 +463,12 @@ impl<'buf> Ptr<'buf, CharSet> {
 #[derive(AnyBitPattern, Copy, Clone, Debug)]
 #[repr(C)]
 pub struct CharSetLeaf {
-    map: [u32; 8],
+    /// The bits in the set, all 256 of them.
+    pub map: [u32; 8],
 }
 
 impl CharSetLeaf {
-    /// Checks whether the bitset part of this chunk contains the given byte.
+    /// Checks whether this set contains the given byte.
     pub fn contains_byte(&self, byte: u8) -> bool {
         let map_idx = (byte >> 5) as usize;
         let bit_idx = (byte & 0x1f) as u32;
@@ -457,6 +476,7 @@ impl CharSetLeaf {
         (self.map[map_idx] >> bit_idx) & 1 != 0
     }
 
+    /// Creates an iterator over bits in this set.
     pub fn iter(self) -> CharSetLeafIter {
         CharSetLeafIter {
             leaf: self,
@@ -465,6 +485,16 @@ impl CharSetLeaf {
     }
 }
 
+impl IntoIterator for CharSetLeaf {
+    type Item = u8;
+    type IntoIter = CharSetLeafIter;
+    fn into_iter(self) -> CharSetLeafIter {
+        self.iter()
+    }
+}
+
+/// An iterator over bits in a [`CharSetLeaf`](crate::CharSetLeaf),
+/// created by [`CharSetLeaf::iter`](crate::CharSetLeaf::iter).
 pub struct CharSetLeafIter {
     leaf: CharSetLeaf,
     map_idx: u8,
