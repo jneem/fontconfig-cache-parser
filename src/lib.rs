@@ -220,7 +220,7 @@ impl<T: AnyBitPattern + Copy> IntoOffset for Offset<T> {
 ///
 /// We encode these offsets using `Offset`, so for example the struct above gets translated to
 ///
-/// ```rust
+/// ```ignore
 /// struct Pattern {
 ///     num: c_int,
 ///     size: c_int,
@@ -246,7 +246,7 @@ impl<T: AnyBitPattern + Copy> IntoOffset for Offset<T> {
 /// sanity-check the low-order bit and then set it to zero. We encode these as `PtrOffset`,
 /// so for example the struct above gets translated to
 ///
-/// ```rust
+/// ```ignore
 /// struct PatternElt {
 ///     object: c_int,
 ///     values: PtrOffset<ValueList>,
