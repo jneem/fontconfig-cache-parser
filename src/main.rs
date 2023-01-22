@@ -18,16 +18,15 @@ fn main() -> anyhow::Result<()> {
 
     for font in cache.set()?.fonts()?.take(1) {
         let font = font?;
-        println!("font {:?}", font.deref()?);
 
         for elt in font.elts()? {
             println!(
                 "object type {:?}",
-                Object::try_from(elt.deref()?.object).unwrap()
+                Object::try_from(elt.data()?.object).unwrap()
             );
 
             for val in elt.values()? {
-                let val = val?.to_value()?;
+                let val = val?;
                 if let fontconfig_cache_parser::Value::String(s) = val {
                     println!("string value: {:?}", String::from_utf8_lossy(s.str()?));
                 } else if let fontconfig_cache_parser::Value::CharSet(cs) = val {

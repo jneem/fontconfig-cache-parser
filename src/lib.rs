@@ -1,3 +1,5 @@
+#![deny(missing_docs)]
+
 //! A crate for parsing fontconfig cache files.
 //!
 //! The fontconfig cache format is a C-style binary format, containing a maze of twisty structs all alike,
@@ -5,9 +7,10 @@
 //! especially if you're only interested in a few parts. The expected workflow of this crate is:
 //!
 //! 1. You read the cache file into memory (possibly using `mmap` if the file is large and performance is important).
-//! 2. You construct a [`Ptr<Cache>`](crate::Cache::from_bytes), borrowing the memory chunk.
-//! 3. You follow the various methods on `Ptr<Cache>` to get `Ptr<SomethingElse>`, and extract the information
-//!   you want like that.
+//! 2. You construct a [`Cache`](crate::Cache::from_bytes), borrowing the memory chunk.
+//! 3. You follow the various methods on `Cache` to get access to the information you want.
+//!    As you follow those methods, the data will be read incrementally from the memory chunk you
+//!    created in part 1.
 
 use bytemuck::AnyBitPattern;
 use std::os::raw::{c_int, c_uint};
@@ -27,13 +30,16 @@ union ValueUnion {
     b: c_int,
     d: f64,
     m: PtrOffset<()>, // TODO
-    c: PtrOffset<CharSet>,
+    c: PtrOffset<CharSetData>,
     f: PtrOffset<()>,
     l: PtrOffset<()>, // TODO
     r: PtrOffset<()>, // TODO
 }
 
-/// A wrapper around fontconfig's `FcValue` type.
+/// A dynamically typed value.
+///
+/// This is a wrapper around fontconfig's `FcValue` type.
+#[allow(missing_docs)]
 #[derive(Clone, Debug)]
 pub enum Value<'buf> {
     Unknown,
@@ -44,7 +50,7 @@ pub enum Value<'buf> {
     Bool(c_int),
     /// Not yet supported
     Matrix(Ptr<'buf, ()>),
-    CharSet(Ptr<'buf, CharSet>),
+    CharSet(CharSet<'buf>),
     /// Not yet supported
     FtFace(Ptr<'buf, ()>),
     /// Not yet supported
@@ -53,6 +59,7 @@ pub enum Value<'buf> {
     Range(Ptr<'buf, ()>),
 }
 
+/// Fontconfig's `FcValue` data type, in the raw serialized format.
 #[derive(AnyBitPattern, Copy, Clone)]
 #[repr(C)]
 pub struct ValueData {
@@ -75,7 +82,7 @@ impl<'buf> Ptr<'buf, ValueData> {
                 3 => String(self.relative_offset(payload.val.s)?),
                 4 => Bool(payload.val.b),
                 5 => Matrix(self.relative_offset(payload.val.m)?),
-                6 => CharSet(self.relative_offset(payload.val.c)?),
+                6 => CharSet(crate::CharSet(self.relative_offset(payload.val.c)?)),
                 7 => FtFace(self.relative_offset(payload.val.f)?),
                 8 => LangSet(self.relative_offset(payload.val.l)?),
                 9 => Range(self.relative_offset(payload.val.r)?),
@@ -85,8 +92,12 @@ impl<'buf> Ptr<'buf, ValueData> {
     }
 }
 
+/// All the different object types supported by fontconfig.
+///
+/// (We currently only actually handle a few of these.)
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
+#[allow(missing_docs)]
 pub enum Object {
     Invalid = 0,
     Family,
@@ -170,8 +181,10 @@ unsafe impl<T: Copy + 'static> bytemuck::Pod for PtrOffset<T> {}
 /// This is basically equivalent to `TryInto<Offset<T>, Error=Error>`, but having this
 /// alias makes type inference work better.
 pub trait IntoOffset: AnyBitPattern + Copy {
+    /// Into an offset of what type?
     type Item: AnyBitPattern + Copy;
 
+    /// Turns `self` into an `Offset`.
     fn into_offset(self) -> Result<Offset<Self::Item>>;
 }
 
@@ -221,7 +234,7 @@ impl<T: AnyBitPattern + Copy> IntoOffset for Offset<T> {
 /// We encode these offsets using `Offset`, so for example the struct above gets translated to
 ///
 /// ```ignore
-/// struct Pattern {
+/// struct PatternData {
 ///     num: c_int,
 ///     size: c_int,
 ///     elts_offset: Offset<PatternElt>,
@@ -247,7 +260,7 @@ impl<T: AnyBitPattern + Copy> IntoOffset for Offset<T> {
 /// so for example the struct above gets translated to
 ///
 /// ```ignore
-/// struct PatternElt {
+/// struct PatternEltData {
 ///     object: c_int,
 ///     values: PtrOffset<ValueList>,
 /// }
@@ -269,36 +282,49 @@ impl std::fmt::Debug for ValueData {
     }
 }
 
+/// A linked list of [`Value`]s, in the raw serialized format.
 #[derive(AnyBitPattern, Copy, Clone, Debug)]
 #[repr(C)]
-pub struct ValueList {
-    next: PtrOffset<ValueList>,
+pub struct ValueListData {
+    next: PtrOffset<ValueListData>,
     value: ValueData,
     binding: c_int,
 }
 
-impl<'buf> Ptr<'buf, ValueList> {
-    fn value(&self) -> Result<Ptr<'buf, ValueData>> {
-        self.relative_offset(offset(std::mem::size_of_val(&self.deref()?.next) as isize))
+/// A linked list of [`Value`]s.
+#[derive(Clone, Debug)]
+struct ValueList<'buf>(pub Ptr<'buf, ValueListData>);
+
+impl<'buf> ValueList<'buf> {
+    fn value(&self) -> Result<Value<'buf>> {
+        self.0
+            .relative_offset(offset(std::mem::size_of_val(&self.0.deref()?.next) as isize))
+            .and_then(|val_ptr| val_ptr.to_value())
     }
 }
 
-pub struct ValueListIter<'buf> {
-    next: Option<Result<Ptr<'buf, ValueList>>>,
+/// An iterator over [`Value`]s.
+#[derive(Clone, Debug)]
+struct ValueListIter<'buf> {
+    next: Option<Result<ValueList<'buf>>>,
 }
 
 impl<'buf> Iterator for ValueListIter<'buf> {
-    type Item = Result<Ptr<'buf, ValueData>>;
+    type Item = Result<Value<'buf>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let next = self.next.take();
         if let Some(Ok(next)) = next {
-            match next.deref() {
+            match next.0.deref() {
                 Ok(next_payload) => {
                     if next_payload.next.0 == 0 {
                         self.next = None;
                     } else {
-                        self.next = Some(next.relative_offset(next_payload.next));
+                        self.next = Some(
+                            next.0
+                                .relative_offset(next_payload.next)
+                                .map(|p| ValueList(p)),
+                        );
                     }
                 }
                 Err(e) => {
@@ -314,63 +340,120 @@ impl<'buf> Iterator for ValueListIter<'buf> {
     }
 }
 
+/// The raw serialized format of a [`Pattern`].
 #[derive(AnyBitPattern, Copy, Clone, Debug)]
 #[repr(C)]
-pub struct Pattern {
-    // The number of elements.
+pub struct PatternData {
+    /// The number of elements in this pattern.
     pub num: c_int,
     // The capacity of the elements array. For serialized data, it's probably
     // the same as `num`.
     _size: c_int,
-    pub elts_offset: Offset<PatternElt>,
+    /// The offset of the element array.
+    pub elts_offset: Offset<PatternEltData>,
     ref_count: c_int,
 }
 
-impl Ptr<'_, Pattern> {
-    pub fn elts(&self) -> Result<impl Iterator<Item = Ptr<PatternElt>> + '_> {
-        let payload = self.deref()?;
-        let elts = self.relative_offset(payload.elts_offset)?;
-        elts.array(payload.num)
+/// A list of properties, each one associated with a range of values.
+#[derive(Clone, Debug)]
+pub struct Pattern<'buf>(pub Ptr<'buf, PatternData>);
+
+impl Pattern<'_> {
+    /// Returns an iterator over the elements in this pattern.
+    pub fn elts(&self) -> Result<impl Iterator<Item = PatternElt> + '_> {
+        let payload = self.0.deref()?;
+        let elts = self.0.relative_offset(payload.elts_offset)?;
+        Ok(elts.array(payload.num)?.map(|ptr| PatternElt(ptr)))
+    }
+
+    /// The serialized pattern data, straight from the fontconfig cache.
+    pub fn data(&self) -> Result<PatternData> {
+        self.0.deref()
     }
 }
 
+/// A single element of a [`Pattern`], in the raw serialized format.
 #[derive(AnyBitPattern, Copy, Clone, Debug)]
 #[repr(C)]
-pub struct PatternElt {
+pub struct PatternEltData {
+    /// The object type tag.
     pub object: c_int,
-    pub values: PtrOffset<ValueList>,
+    /// Offset of the linked list of values.
+    pub values: PtrOffset<ValueListData>,
 }
 
-impl Ptr<'_, PatternElt> {
-    pub fn values(&self) -> Result<impl Iterator<Item = Result<Ptr<ValueData>>> + '_> {
+/// A single element of a [`Pattern`].
+///
+/// This consists of an [`Object`] type, and a range of values. By convention,
+/// the values are all of the same [`Value`] variant (of a type determined by the object
+/// tag), but this is not actually enforced.
+pub struct PatternElt<'buf>(pub Ptr<'buf, PatternEltData>);
+
+impl<'buf> PatternElt<'buf> {
+    /// An iterator over the values in this `PatternElt`.
+    pub fn values(&self) -> Result<impl Iterator<Item = Result<Value<'buf>>> + 'buf> {
         Ok(ValueListIter {
-            next: Some(Ok(self.relative_offset(self.deref()?.values)?)),
+            next: Some(Ok(ValueList(
+                self.0.relative_offset(self.0.deref()?.values)?,
+            ))),
         })
     }
-}
 
-#[derive(AnyBitPattern, Copy, Clone, Debug)]
-#[repr(C)]
-pub struct FontSet {
-    pub nfont: c_int,
-    // FIXME: what's this? Capacity?
-    pub sfont: c_int,
-    pub fonts: PtrOffset<PtrOffset<Pattern>>,
-}
+    /// The object tag, describing the font property that this `PatternElt` represents.
+    pub fn object(&self) -> Result<Object> {
+        self.0.deref()?.object.try_into()
+    }
 
-impl Ptr<'_, FontSet> {
-    pub fn fonts(&self) -> Result<impl Iterator<Item = Result<Ptr<Pattern>>> + '_> {
-        let payload = self.deref()?;
-        let fonts = self.relative_offset(payload.fonts)?.array(payload.nfont)?;
-        let me = self.clone();
-        Ok(fonts.map(move |font_offset| me.relative_offset(font_offset.deref()?)))
+    /// The serialized pattern elt data, straight from the fontconfig cache.
+    pub fn data(&self) -> Result<PatternEltData> {
+        self.0.deref()
     }
 }
 
-/// A set of code points.
+/// A set of fonts, in the raw serialized format.
 ///
 /// This struct is just the plain old data stored in the cache. To access
-/// this set, look at [`Ptr<CharSet>`](crate::Ptr), which represents the char set
+/// fonts in this set, look at [`FontSet`], which represents the font set
+/// in the context of the cache file.
+#[derive(AnyBitPattern, Copy, Clone, Debug)]
+#[repr(C)]
+pub struct FontSetData {
+    /// The number of fonts in this set.
+    pub nfont: c_int,
+    // Capacity of the font array. Uninteresting for the serialized format.
+    _sfont: c_int,
+    /// Pointer to an array of fonts.
+    ///
+    /// All the offsets here (both outer and inner) are relative to this `FontSetData`.
+    pub fonts: PtrOffset<PtrOffset<PatternData>>,
+}
+
+/// A set of fonts.
+#[derive(Clone, Debug)]
+pub struct FontSet<'buf>(pub Ptr<'buf, FontSetData>);
+
+impl<'buf> FontSet<'buf> {
+    /// Returns an iterator over the fonts in this set.
+    pub fn fonts<'a>(&'a self) -> Result<impl Iterator<Item = Result<Pattern<'buf>>> + 'a> {
+        let payload = self.0.deref()?;
+        let fonts = self
+            .0
+            .relative_offset(payload.fonts)?
+            .array(payload.nfont)?;
+        let me = self.clone();
+        Ok(fonts.map(move |font_offset| Ok(Pattern(me.0.relative_offset(font_offset.deref()?)?))))
+    }
+
+    /// The serialized font set data, straight from the fontconfig cache.
+    pub fn data(&self) -> Result<FontSetData> {
+        self.0.deref()
+    }
+}
+
+/// A set of code points, in the raw serialized format.
+///
+/// This struct is just the plain old data stored in the cache. To access
+/// this set, look at [`CharSet`], which represents the char set
 /// in the context of the cache file.
 ///
 /// # Implementation details
@@ -382,7 +465,7 @@ impl Ptr<'_, FontSet> {
 /// big enough for the unicode range.)
 #[derive(AnyBitPattern, Copy, Clone, Debug)]
 #[repr(C)]
-pub struct CharSet {
+pub struct CharSetData {
     // Reference count. Not interesting for us.
     ref_count: c_int,
     /// Length of both of the following arrays
@@ -394,20 +477,26 @@ pub struct CharSet {
     pub numbers: Offset<u16>,
 }
 
-impl<'buf> Ptr<'buf, CharSet> {
+/// A set of code points.
+#[derive(Clone, Debug)]
+pub struct CharSet<'buf>(pub Ptr<'buf, CharSetData>);
+
+impl<'buf> CharSet<'buf> {
     /// Returns an iterator over the leaf bitsets.
-    pub fn leaves(&self) -> Result<impl Iterator<Item = Result<Ptr<'buf, CharSetLeaf>>> + 'buf> {
-        let payload = self.deref()?;
-        let leaf_array = self.relative_offset(payload.leaves)?;
-        Ok(leaf_array
-            .array(payload.num)?
-            .map(move |leaf_offset| leaf_array.relative_offset(leaf_offset.deref()?)))
+    pub fn leaves(&self) -> Result<impl Iterator<Item = Result<CharSetLeaf>> + 'buf> {
+        let payload = self.0.deref()?;
+        let leaf_array = self.0.relative_offset(payload.leaves)?;
+        Ok(leaf_array.array(payload.num)?.map(move |leaf_offset| {
+            leaf_array
+                .relative_offset(leaf_offset.deref()?)
+                .and_then(|leaf_ptr| leaf_ptr.deref())
+        }))
     }
 
     /// Returns an iterator over the 16-bit leaf offsets.
     pub fn numbers(&self) -> Result<Array<'buf, u16>> {
-        let payload = self.deref()?;
-        self.relative_offset(payload.numbers)?.array(payload.num)
+        let payload = self.0.deref()?;
+        self.0.relative_offset(payload.numbers)?.array(payload.num)
     }
 
     /// Creates an iterator over the codepoints in this charset.
@@ -427,23 +516,27 @@ impl<'buf> Ptr<'buf, CharSet> {
 
         let leaves = self.leaves()?;
         let numbers = self.numbers()?;
-        Ok(leaves.zip(numbers).flat_map(|(maybe_leaf, number)| {
+        Ok(leaves.zip(numbers).flat_map(|(leaf, number)| {
             let iter = (move || {
                 let number = (number.deref()? as u32) << 8;
-                let leaf = maybe_leaf?.deref()?;
-                Ok(leaf.iter().map(move |x| x as u32 + number))
+                Ok(leaf?.iter().map(move |x| x as u32 + number))
             })();
             transpose_result_iter(iter)
         }))
     }
 
-    pub fn leaf_at(&self, idx: usize) -> Result<Option<Ptr<'buf, CharSetLeaf>>> {
-        let payload = self.deref()?;
-        let leaf_array = self.relative_offset(payload.leaves)?;
+    /// The `CharSetLeaf` at the given index, if there is one.
+    pub fn leaf_at(&self, idx: usize) -> Result<Option<CharSetLeaf>> {
+        let payload = self.0.deref()?;
+        let leaf_array = self.0.relative_offset(payload.leaves)?;
         leaf_array
             .array(payload.num)?
             .get(idx)
-            .map(|ptr| leaf_array.relative_offset(ptr.deref()?))
+            .map(|ptr| {
+                leaf_array
+                    .relative_offset(ptr.deref()?)
+                    .and_then(|leaf_ptr| leaf_ptr.deref())
+            })
             .transpose()
     }
 
@@ -453,7 +546,7 @@ impl<'buf> Ptr<'buf, CharSet> {
         let lo = (ch & 0xff) as u8;
         match self.numbers()?.as_slice()?.binary_search(&hi) {
             // The unwrap will succeed because numbers and leaves have the same length.
-            Ok(idx) => Ok(self.leaf_at(idx)?.unwrap().deref()?.contains_byte(lo)),
+            Ok(idx) => Ok(self.leaf_at(idx)?.unwrap().contains_byte(lo)),
             Err(_) => Ok(false),
         }
     }
@@ -495,6 +588,7 @@ impl IntoIterator for CharSetLeaf {
 
 /// An iterator over bits in a [`CharSetLeaf`](crate::CharSetLeaf),
 /// created by [`CharSetLeaf::iter`](crate::CharSetLeaf::iter).
+#[derive(Clone, Debug)]
 pub struct CharSetLeafIter {
     leaf: CharSetLeaf,
     map_idx: u8,
@@ -523,47 +617,43 @@ impl Iterator for CharSetLeafIter {
     }
 }
 
-#[derive(AnyBitPattern, Copy, Clone, Debug)]
-#[repr(C)]
-pub struct StrSet {
-    pub ref_count: c_int,
-    pub num: c_int,
-    pub size: c_int,
-    pub strs: PtrOffset<PtrOffset<u8>>,
-    pub control: c_uint,
-}
-
-#[derive(AnyBitPattern, Copy, Clone, Debug)]
-#[repr(C)]
-pub struct LangSet {
-    extra: PtrOffset<StrSet>,
-    map_size: u32,
-}
-
-/// The fontconfig cache header.
+/// The fontconfig cache header, in the raw serialized format.
 ///
-/// This is just the plain old data in the header. If you want to actually access any other parts
-/// of the cache file, you'll need to look at [`Ptr<Cache>`](crate::Ptr), which represents the
-/// header in the context of the rest of the cache. (I know this is annoying;
-/// I haven't figured out how to make rustdoc organize it nicely.)
+/// This is just the plain old data from the fontconfig cache. If you want to
+/// actually access any other parts of the cache file, you'll need to look at
+/// [`Cache`], which represents the header in the context of the rest of the
+/// cache.
 #[derive(AnyBitPattern, Copy, Clone, Debug)]
 #[repr(C)]
-pub struct Cache {
+pub struct CacheData {
+    /// The magic 4 bytes marking the data as a fontconfig cache.
     pub magic: c_uint,
+    /// The cache format version. We support versions 7 and 8.
     pub version: c_int,
+    /// The size of the cache.
     pub size: isize,
+    /// This cache caches the data of all fonts in some directory.
+    /// Here is (an offset to) the name of that directory.
     pub dir: Offset<u8>,
+    /// Here is an offset to an array of offsets to the names of
+    /// subdirectories.
     pub dirs: Offset<Offset<u8>>,
+    /// How many subdirectories are there?
     pub dirs_count: c_int,
-    pub set: Offset<FontSet>,
+    /// An offset to the set of fonts in this cache.
+    pub set: Offset<FontSetData>,
+    /// A "checksum" of this cache (but really just a timestamp).
     pub checksum: c_int,
+    /// Another "checksum" of this cache (but really just a more precise timestamp).
     pub checksum_nano: c_int,
 }
 
 /// A reference to a fontconfig struct that's been serialized in a buffer.
 #[derive(Clone)]
 pub struct Ptr<'buf, S> {
+    /// We point at this `offset`, relative to the buffer.
     pub offset: isize,
+    /// The buffer that we point into.
     pub buf: &'buf [u8],
     marker: std::marker::PhantomData<S>,
 }
@@ -730,6 +820,7 @@ impl<'buf, S: AnyBitPattern> Ptr<'buf, S> {
 
 /// All the possible errors we can encounter when parsing the cache file.
 #[derive(Clone, Debug, thiserror::Error)]
+#[allow(missing_docs)]
 pub enum Error {
     #[error("Invalid magic number {0:#x}")]
     BadMagic(c_uint),
@@ -765,19 +856,23 @@ pub enum Error {
     WrongSize { expected: isize, actual: isize },
 }
 
-impl Cache {
+/// The fontconfig cache header.
+#[derive(Clone, Debug)]
+pub struct Cache<'buf>(Ptr<'buf, CacheData>);
+
+impl<'buf> Cache<'buf> {
     /// Read a cache from a slice of bytes.
-    pub fn from_bytes(buf: &[u8]) -> Result<Ptr<'_, Cache>> {
+    pub fn from_bytes(buf: &'buf [u8]) -> Result<Self> {
         use Error::*;
 
-        let len = std::mem::size_of::<Cache>();
+        let len = std::mem::size_of::<CacheData>();
         if buf.len() < len {
             Err(WrongSize {
                 expected: len as isize,
                 actual: buf.len() as isize,
             })
         } else {
-            let cache: Cache = bytemuck::try_pod_read_unaligned(&buf[0..len])
+            let cache: CacheData = bytemuck::try_pod_read_unaligned(&buf[0..len])
                 .expect("but we checked the length...");
 
             if cache.magic != 4228054020 {
@@ -790,19 +885,22 @@ impl Cache {
                     actual: buf.len() as isize,
                 })
             } else {
-                Ok(Ptr {
+                Ok(Cache(Ptr {
                     buf,
                     offset: 0,
                     marker: std::marker::PhantomData,
-                })
+                }))
             }
         }
     }
-}
 
-impl<'buf> Ptr<'buf, Cache> {
     /// The [`FontSet`](crate::FontSet) stored in this cache.
-    pub fn set(&self) -> Result<Ptr<'buf, FontSet>> {
-        self.relative_offset(self.deref()?.set)
+    pub fn set(&self) -> Result<FontSet<'buf>> {
+        Ok(FontSet(self.0.relative_offset(self.0.deref()?.set)?))
+    }
+
+    /// The serialized cache data, straight from the fontconfig cache.
+    pub fn data(&self) -> Result<CacheData> {
+        self.0.deref()
     }
 }
