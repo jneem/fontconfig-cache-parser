@@ -467,7 +467,14 @@ impl<'buf> Cache<'buf> {
 
             if cache.magic != 4228054020 {
                 Err(BadMagic(cache.magic))
-            } else if cache.version != 7 && cache.version != 8 {
+            // We support versions 7 through 9.
+            // Version 7 was introduced in 2015 (fontconfig git ref ad9f5880, released in fontconfig
+            // 2.11.95)
+            // The 7 -> 8 change didn't affect the cache format (fontconfig git ref 5d84745e,
+            // released in fontconfig 2.13.95)
+            // The 8 -> 9 change affected the format of language data, which we
+            // don't currently support. (fontconfig git ref ce9cbe36, released in fontconfig 2.15.0)
+            } else if cache.version < 7 || cache.version > 9 {
                 Err(UnsupportedVersion(cache.version))
             } else if cache.size != buf.len() as isize {
                 Err(WrongSize {
