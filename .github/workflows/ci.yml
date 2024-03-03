@@ -13,7 +13,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo fmt --all --check
 
-  clippy+test:
+  clippy-test:
     runs-on: ubuntu-latest
     name: Check workspace compile
     steps:
