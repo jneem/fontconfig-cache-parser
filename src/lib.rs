@@ -180,11 +180,7 @@ impl<'buf> Iterator for ValueListIter<'buf> {
                     if next_payload.next.0 == 0 {
                         self.next = None;
                     } else {
-                        self.next = Some(
-                            next.0
-                                .relative_offset(next_payload.next)
-                                .map(|p| ValueList(p)),
-                        );
+                        self.next = Some(next.0.relative_offset(next_payload.next).map(ValueList));
                     }
                 }
                 Err(e) => {
@@ -209,7 +205,7 @@ impl Pattern<'_> {
     pub fn elts(&self) -> Result<impl Iterator<Item = PatternElt> + '_> {
         let payload = self.0.deref()?;
         let elts = self.0.relative_offset(payload.elts_offset)?;
-        Ok(elts.array(payload.num)?.map(|ptr| PatternElt(ptr)))
+        Ok(elts.array(payload.num)?.map(PatternElt))
     }
 
     /// The serialized pattern data, straight from the fontconfig cache.
