@@ -14,7 +14,7 @@
         pkgs = import nixpkgs {
           inherit system overlays;
         };
-        rust-toolchain = pkgs.fenix.stable.withComponents [
+        rust-toolchain = pkgs.fenix.latest.withComponents [
           "cargo"
           "clippy"
           "rustc"

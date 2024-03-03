@@ -243,6 +243,10 @@ impl<'buf> Ptr<'buf, u8> {
     }
 }
 
+fn offset_to_usize(off: isize) -> Result<usize> {
+    off.try_into().map_err(|_| Error::BadOffset(off))
+}
+
 impl<'buf, S: AnyBitPattern> Ptr<'buf, S> {
     /// Turn `offset` into a pointer, assuming that it's an offset relative to this pointer.
     ///
@@ -266,16 +270,16 @@ impl<'buf, S: AnyBitPattern> Ptr<'buf, S> {
     /// "Dereference" this pointer, returning a plain struct.
     pub fn deref(&self) -> Result<S> {
         let len = std::mem::size_of::<S>() as isize;
-        if self.offset + len > self.buf.len() as isize {
-            Err(Error::BadOffset(self.offset))
-        } else {
-            // We checked at construction time that the buffer has enough elements for the payload,
-            // so the slice will succeed.
-            Ok(bytemuck::try_pod_read_unaligned(
-                &self.buf[(self.offset as usize)..((self.offset + len) as usize)],
-            )
-            .expect("but we checked the length..."))
-        }
+        let offset = offset_to_usize(self.offset)?;
+        let end = offset_to_usize(self.offset.wrapping_add(len))?;
+
+        let slice = self
+            .buf
+            .get(offset..end)
+            .ok_or(Error::BadOffset(self.offset))?;
+
+        // bytemuck should succeed because we checked the length
+        Ok(bytemuck::try_pod_read_unaligned(slice).expect("but we checked the length..."))
     }
 
     /// Treating this pointer as a reference to the start of an array of length `count`,
