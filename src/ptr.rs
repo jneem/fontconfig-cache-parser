@@ -266,7 +266,7 @@ impl<'buf, S: AnyBitPattern> Ptr<'buf, S> {
     /// "Dereference" this pointer, returning a plain struct.
     pub fn deref(&self) -> Result<S> {
         let len = std::mem::size_of::<S>() as isize;
-        if self.offset + len >= self.buf.len() as isize {
+        if self.offset + len > self.buf.len() as isize {
             Err(Error::BadOffset(self.offset))
         } else {
             // We checked at construction time that the buffer has enough elements for the payload,
