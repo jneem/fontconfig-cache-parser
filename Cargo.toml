@@ -8,7 +8,9 @@ repository = "https://github.com/jneem/fontconfig-cache-parser"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-anyhow = "1.0.66"
 bytemuck = { version = "1.12.2", features = ["derive"] }
-clap = { version = "4.0.19", features = ["derive"] }
 thiserror = "1.0.37"
+
+[dev-dependencies]
+anyhow = "1.0.66"
+clap = { version = "4.0.19", features = ["derive"] }
