@@ -133,9 +133,12 @@ pub enum Object {
     Variable,
     FontHasHint,
     Order,
+    DesktopName,
+    NamedInstance,
+    FontWrapper,
 }
 
-const MAX_OBJECT: c_int = Object::Order as c_int;
+const MAX_OBJECT: c_int = Object::FontWrapper as c_int;
 
 impl TryFrom<c_int> for Object {
     type Error = Error;
