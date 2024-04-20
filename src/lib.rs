@@ -79,6 +79,7 @@ impl<'buf> Ptr<'buf, ValueData> {
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 #[allow(missing_docs)]
+#[non_exhaustive]
 pub enum Object {
     Invalid = 0,
     Family,
