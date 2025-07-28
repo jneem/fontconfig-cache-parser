@@ -129,7 +129,7 @@ pub union ValueUnion {
     pub c: PtrOffset<CharSetData>,
     pub f: PtrOffset<()>,
     pub l: PtrOffset<()>, // TODO
-    pub r: PtrOffset<()>, // TODO
+    pub r: PtrOffset<RangeData>,
 }
 
 /// A set of code points, in the raw serialized format.
@@ -153,4 +153,15 @@ pub struct CharSetData {
     pub leaves: Offset<Offset<CharSetLeaf>>,
     /// Array having the same length as `leaves`, and storing the 16-bit offsets of each leaf.
     pub numbers: Offset<u16>,
+}
+
+
+/// A range of floating point numbers, in the raw serialized format.
+#[derive(AnyBitPattern, Copy, Clone, Debug)]
+#[repr(C)]
+pub struct RangeData {
+    /// begin value of the range
+    pub begin: f64,
+    /// end value of the range
+    pub end: f64,
 }

@@ -19,7 +19,7 @@ pub mod data;
 pub mod ptr;
 
 use data::{
-    CacheData, CharSetData, FontSetData, PatternData, PatternEltData, ValueData, ValueListData,
+    CacheData, CharSetData, FontSetData, PatternData, PatternEltData, RangeData, ValueData, ValueListData,
 };
 use ptr::{Array, Ptr};
 
@@ -44,8 +44,7 @@ pub enum Value<'buf> {
     FtFace(Ptr<'buf, ()>),
     /// Not yet supported
     LangSet(Ptr<'buf, ()>),
-    /// Not yet supported
-    Range(Ptr<'buf, ()>),
+    Range(Range<'buf>),
 }
 
 impl<'buf> Ptr<'buf, ValueData> {
@@ -66,7 +65,7 @@ impl<'buf> Ptr<'buf, ValueData> {
                 6 => CharSet(crate::CharSet(self.relative_offset(payload.val.c)?)),
                 7 => FtFace(self.relative_offset(payload.val.f)?),
                 8 => LangSet(self.relative_offset(payload.val.l)?),
-                9 => Range(self.relative_offset(payload.val.r)?),
+                9 => Range(crate::Range(self.relative_offset(payload.val.r)?)),
                 _ => return Err(Error::InvalidEnumTag(payload.ty)),
             })
         }
@@ -265,6 +264,18 @@ impl<'buf> FontSet<'buf> {
     /// The serialized font set data, straight from the fontconfig cache.
     pub fn data(&self) -> Result<FontSetData> {
         self.0.deref()
+    }
+}
+
+/// A range of begin and end values
+#[derive(Clone, Debug)]
+pub struct Range<'buf>(pub Ptr<'buf, RangeData>);
+
+impl<'buf> Range<'buf> {
+    /// Return range data
+    pub fn range(&self) -> Result<RangeData> {
+        let payload = self.0.deref()?;
+        Ok(payload)
     }
 }
 
