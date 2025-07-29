@@ -19,7 +19,8 @@ pub mod data;
 pub mod ptr;
 
 use data::{
-    CacheData, CharSetData, FontSetData, PatternData, PatternEltData, RangeData, ValueData, ValueListData,
+    CacheData, CharSetData, FontSetData, PatternData, PatternEltData, RangeData, ValueData,
+    ValueListData,
 };
 use ptr::{Array, Ptr};
 

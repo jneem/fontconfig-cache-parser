@@ -155,7 +155,6 @@ pub struct CharSetData {
     pub numbers: Offset<u16>,
 }
 
-
 /// A range of floating point numbers, in the raw serialized format.
 #[derive(AnyBitPattern, Copy, Clone, Debug)]
 #[repr(C)]
