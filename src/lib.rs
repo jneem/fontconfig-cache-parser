@@ -146,7 +146,7 @@ impl TryFrom<c_int> for Object {
 
     fn try_from(value: c_int) -> Result<Self> {
         if value <= MAX_OBJECT {
-            Ok(unsafe { std::mem::transmute(value) })
+            Ok(unsafe { std::mem::transmute::<i32, Object>(value) })
         } else {
             Err(Error::InvalidObjectTag(value))
         }
@@ -206,7 +206,7 @@ pub struct Pattern<'buf>(pub Ptr<'buf, PatternData>);
 
 impl Pattern<'_> {
     /// Returns an iterator over the elements in this pattern.
-    pub fn elts(&self) -> Result<impl Iterator<Item = PatternElt> + '_> {
+    pub fn elts(&self) -> Result<impl Iterator<Item = PatternElt<'_>> + '_> {
         let payload = self.0.deref()?;
         let elts = self.0.relative_offset(payload.elts_offset)?;
         Ok(elts.array(payload.num)?.map(PatternElt))
