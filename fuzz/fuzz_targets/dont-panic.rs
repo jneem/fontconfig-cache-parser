@@ -11,7 +11,8 @@ fn run(data: &[u8]) -> anyhow::Result<()> {
         for elt in font.elts()? {
             let _ = elt.data()?;
 
-            for val in elt.values()? {
+            // `values` is a linked list, so it could be a cycle. Truncate it.
+            for val in elt.values()?.take(5) {
                 let val = val?;
                 if let fontconfig_cache_parser::Value::String(s) = val {
                     let _ = s.str()?;

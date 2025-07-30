@@ -30,6 +30,8 @@
             cargo-fuzz
             rust-toolchain
           ];
+
+          LIBCXX = pkgs.lib.makeLibraryPath [stdenv.cc.cc];
         };
       }
     );
